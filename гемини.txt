@@ -1,0 +1,1661 @@
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/* =========================================================================
+   ИНТЕРФЕЙСЫ
+   ========================================================================= */
+
+interface IERC20 {
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IPermit2 {
+    function transferFrom(address from, address to, uint160 amount, address token) external;
+    function allowance(address owner, address token, address spender)
+        external view returns (uint160 amount, uint48 expiration, uint48 nonce);
+}
+
+interface ISwapAdapter {
+    function swap(
+        address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut,
+        address recipient, uint256 deadline, bytes calldata data
+    ) external returns (uint256 amountOut);
+    function guard() external view returns (address);
+    function router() external view returns (address);
+}
+
+interface ISmartWallet {
+    function guard() external view returns (address);
+    function permit2() external view returns (address);
+    function paused() external view returns (bool);
+    function sendNativeByGuard(address payable to, uint256 amount) external;
+    function proposeGuardMigration(address newGuard) external;
+    function acceptGuardMigration() external;
+    function enablePermit2ForGuard(address token) external;
+    function emergencyEnablePermit2ForGuard(address token) external;
+    function revokePermit2ForGuard(address token) external;
+    function permit2Enabled(address token) external view returns (bool);
+}
+
+interface IGuardState {
+    function mainWallet() external view returns (address);
+    function permit2() external view returns (address);
+    function migratedOut() external view returns (bool);
+    function getOwners() external view returns (address[] memory);
+    function isOwnerHot(address owner) external view returns (bool);
+    function hotWallets(address w) external view returns (bool);
+    function coldWallets(address w) external view returns (bool);
+    function approvedToken(address token) external view returns (bool);
+    function approvedRouter(address router) external view returns (bool);
+    function blacklist(address target) external view returns (bool);
+    function migrationEmergencyKey() external view returns (address);
+    function getWhitelistEntry(address recipient, address token)
+        external view returns (bool exists, uint256 limit, uint256 remaining, uint256 deadline);
+    function getRecoveryTarget(address w, address token)
+        external view returns (bool exists, address recipient);
+
+    function treasury() external view returns (address);
+    function appVersionHash() external view returns (bytes32);
+    function approvedTradingPlatform(address platform) external view returns (bool);
+    function p2pAdmin() external view returns (address);
+    function p2pDAO() external view returns (address);
+    function p2pTimeout() external view returns (uint64);
+    function getPlanConfig(uint8 plan)
+        external view returns (address paymentToken, uint256 price, uint64 period, bool enabled);
+    function getRawSubscription() external view returns (uint8 plan, uint64 expiresAt);
+}
+
+interface IGuardMigration {
+    function acceptMigration(
+        address oldGuard,
+        address mainWallet,
+        bytes32 migrationDataHash,
+        bytes calldata migrationData
+    ) external;
+}
+
+abstract contract ReentrancyGuard {
+    uint256 private _locked = 1;
+    modifier nonReentrant() {
+        require(_locked == 1, "reentrant");
+        _locked = 2;
+        _;
+        _locked = 1;
+    }
+}
+
+/* =========================================================================
+   SMART WALLET GUARD v5.1.8
+   =========================================================================
+   Правки относительно v5.1.7:
+
+   MUST-FIX:
+     1. acceptMigration: cross-check теперь БЕЗУСЛОВНЫЙ для subscription,
+        treasury, appVersionHash, P2P config. Требуется точное совпадение
+        с raw-состоянием old guard. Предотвращает потерю state через
+        подписанную, но некорректную migrationData (например, subscription
+        со сброшенным expiresAt=0 при активной подписке).
+     2. Добавлено state `address public migratedTo`. Устанавливается в
+        finalizeMigration. `proposeWalletGuardMigration` больше не имеет
+        модификатора `notMigrated` — можно подавать wallet proposals
+        ПОСЛЕ finalize, используя `migratedTo` как утверждённый newGuard.
+        Устраняет требование успеть со всеми wallets в 48h окне.
+     3. `_checkWalletGuard(w)` добавлен в `emergencySweep` для
+        консистентности с transfer/transferNative/executeSwap/subscribe.
+
+   DOCUMENTATION:
+     - executeSwap whitelist для (recipient, tokenOut) — сознательное
+       расширение ТЗ §23 для жёсткого лимита на получателя swap.
+       Клиент обязан ставить minAmountOut с учётом возможного overshoot:
+       если remaining = R, а favorable slippage даёт actualOut > R,
+       транзакция ревертится (safe-by-default). Это гарантирует, что
+       whitelist limit никогда не будет превышен.
+     - После wallet migration old guard продолжает хранить wallet в
+       реестре (исторический snapshot). Все операции old guard
+       блокируются через `notMigrated`. Удаление wallet из old реестра
+       невозможно (immutable contract).
+     - subscribe требует, чтобы wallet уже был мигрирован на текущий
+       guard. Последовательность: wallet migration → enablePermit2 →
+       subscribe.
+
+   Открытые пункты ТЗ (требуют обновления):
+     §63 — emergency migration сохраняет 48h delay
+     §64 — adapter policies не мигрируются (immutable guard)
+     §82 — events семантически эквивалентны, имена иные
+     §100 — permission bits зарезервированы для будущих модулей
+     §113 — getWhitelist() невозможен on-chain (mapping)
+     §114 — VERSION = "5.1.8"
+     §7 — nonce scope для emergencySweep = wallet, для subscribe = fromWallet
+   ========================================================================= */
+
+contract SmartWalletGuard is ReentrancyGuard, IGuardMigration {
+
+    string public constant VERSION = "5.1.8";
+    address public constant NATIVE = address(0);
+
+    // ---------- EIP-712 typehashes ----------
+
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    bytes32 private constant TRANSFER_TYPEHASH = keccak256(
+        "Transfer(address wallet,address token,address recipient,uint256 amount,uint256 nonce,uint256 deadline)");
+    bytes32 private constant NATIVE_TRANSFER_TYPEHASH = keccak256(
+        "NativeTransfer(address wallet,address recipient,uint256 amount,uint256 nonce,uint256 deadline)");
+    bytes32 private constant SWAP_TYPEHASH = keccak256(
+        "Swap(address wallet,address adapter,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,address recipient,bytes32 adapterDataHash,uint256 nonce,uint256 deadline)");
+    bytes32 private constant WHITELIST_TYPEHASH = keccak256(
+        "WhitelistOp(uint8 op,address recipient,address token,uint256 limit,uint256 whitelistDeadline,uint256 nonce,uint256 deadline)");
+    bytes32 private constant ADAPTER_TYPEHASH = keccak256(
+        "AdapterOp(uint8 op,address adapter,address token,uint256 limit,uint256 adapterDeadline,uint256 nonce,uint256 deadline)");
+    bytes32 private constant BLACKLIST_TYPEHASH = keccak256(
+        "BlacklistOp(uint8 op,address target,uint256 nonce,uint256 deadline)");
+    bytes32 private constant HOTWALLET_TYPEHASH = keccak256(
+        "HotWalletOp(uint8 op,address wallet,uint256 nonce,uint256 deadline)");
+    bytes32 private constant COLDWALLET_TYPEHASH = keccak256(
+        "ColdWalletOp(uint8 op,address wallet,uint256 nonce,uint256 deadline)");
+    bytes32 private constant OWNERS_TYPEHASH = keccak256(
+        "ChangeOwners(address mainWallet,address[] newOwners,bool[] newIsHot,uint256 nonce,uint256 deadline)");
+    bytes32 private constant TOKEN_TYPEHASH = keccak256(
+        "TokenOp(uint8 op,address token,uint256 nonce,uint256 deadline)");
+    bytes32 private constant ROUTER_TYPEHASH = keccak256(
+        "RouterOp(uint8 op,address router,uint256 nonce,uint256 deadline)");
+    bytes32 private constant RECOVERY_TARGET_TYPEHASH = keccak256(
+        "RecoveryTargetOp(uint8 op,address wallet,address token,address recipient,uint256 nonce,uint256 deadline)");
+    bytes32 private constant EMERGENCY_SWEEP_TYPEHASH = keccak256(
+        "EmergencySweep(address wallet,address token,address recipient,uint256 nonce,uint256 deadline)");
+    bytes32 private constant MIGRATION_TYPEHASH = keccak256(
+        "Migration(address mainWallet,address newGuard,bytes32 migrationDataHash,uint256 nonce,uint256 executeAfter,uint256 deadline)");
+    bytes32 private constant CANCEL_MIGRATION_TYPEHASH = keccak256(
+        "CancelMigration(address mainWallet,address newGuard,uint256 nonce,uint256 deadline)");
+    bytes32 private constant MIGRATION_EMERGENCY_TYPEHASH = keccak256(
+        "MigrationEmergency(address mainWallet,address newGuard,bytes32 migrationDataHash,uint256 nonce,uint256 executeAfter,uint256 deadline)");
+    bytes32 private constant MIGRATION_EMERGENCY_KEY_TYPEHASH = keccak256(
+        "SetMigrationEmergencyKey(address mainWallet,address newKey,uint256 nonce,uint256 deadline)");
+
+    bytes32 private constant SUBSCRIBE_TYPEHASH = keccak256(
+        "Subscribe(address mainWallet,uint8 plan,address paymentToken,uint256 price,address fromWallet,uint256 nonce,uint256 deadline)");
+    bytes32 private constant SET_TREASURY_TYPEHASH = keccak256(
+        "SetTreasury(address mainWallet,address treasury,uint256 nonce,uint256 deadline)");
+    bytes32 private constant SET_PLAN_CONFIG_TYPEHASH = keccak256(
+        "SetPlanConfig(address mainWallet,uint8 plan,address paymentToken,uint256 price,uint64 period,bool enabled,uint256 nonce,uint256 deadline)");
+    bytes32 private constant SET_APP_VERSION_TYPEHASH = keccak256(
+        "SetAppVersion(address mainWallet,bytes32 versionHash,uint256 nonce,uint256 deadline)");
+    bytes32 private constant TRADING_PLATFORM_TYPEHASH = keccak256(
+        "TradingPlatformOp(uint8 op,address platform,uint256 nonce,uint256 deadline)");
+    bytes32 private constant SET_P2P_CONFIG_TYPEHASH = keccak256(
+        "SetP2PConfig(address mainWallet,address p2pAdmin,address p2pDAO,uint64 timeout,uint256 nonce,uint256 deadline)");
+    bytes32 private constant REVOKE_PERMIT2_ON_WALLET_TYPEHASH = keccak256(
+        "RevokePermit2OnWallet(address mainWallet,address wallet,address token,uint256 nonce,uint256 deadline)");
+
+    bytes32 private constant SECP256K1N_HALF =
+        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+
+    bytes32 public immutable DOMAIN_SEPARATOR;
+    address public immutable mainWallet;
+    address public immutable permit2;
+    address public immutable expectedOldGuard;
+
+    uint256 public constant HOT_THRESHOLD = 2;
+    uint256 public constant CRITICAL_THRESHOLD = 3;
+    uint256 public constant TOTAL_OWNERS = 5;
+    uint256 public constant HOT_OWNERS = 3;
+    uint256 public constant MIGRATION_DELAY = 48 hours;
+    uint256 public constant MAX_MIGRATION_CANCELS = 3;
+
+    uint256 public constant PERM_APP_VERIFY = 1 << 0;
+    uint256 public constant PERM_EMERGENCY  = 1 << 1;
+    uint256 public constant PERM_COLD_WARM  = 1 << 2;
+    uint256 public constant PERM_P2P        = 1 << 3;
+    uint256 public constant PERM_SECURITY   = 1 << 4;
+    uint256 public constant PERM_TRADING    = 1 << 5;
+
+    bool public migratedOut;
+    bool public migrationAccepted;
+    /// @notice Guard, на который этот Guard мигрировал. Устанавливается в finalizeMigration.
+    ///         Используется в proposeWalletGuardMigration после finalize.
+    address public migratedTo; // v5.1.8
+
+    address[] public owners;
+    struct OwnerInfo { bool isOwner; bool isHot; }
+    mapping(address => OwnerInfo) public ownerInfo;
+
+    mapping(address => bool) public hotWallets;
+    mapping(address => bool) public coldWallets;
+
+    struct WhitelistEntry { bool exists; uint256 limit; uint256 remaining; uint256 deadline; }
+    struct AdapterPolicy { bool exists; uint256 limit; uint256 remaining; uint256 deadline; }
+    struct RecoveryTarget { bool exists; address recipient; }
+
+    mapping(address => mapping(address => WhitelistEntry)) public whitelist;
+    mapping(address => mapping(address => AdapterPolicy)) public adapterPolicy;
+    mapping(address => bool) public blacklist;
+    mapping(address => bool) public approvedToken;
+    mapping(address => bool) public approvedRouter;
+    mapping(address => mapping(address => RecoveryTarget)) public recoveryTargets;
+
+    mapping(address => mapping(uint256 => bool)) public usedNonces;
+
+    struct Migration {
+        address newGuard;
+        bytes32 migrationDataHash;
+        uint256 proposedAt;
+        uint256 executeAfter;
+        uint256 cancelCount;
+        bool pending;
+    }
+    Migration public pendingMigration;
+    mapping(address => mapping(address => uint256)) public migrationCancelCount;
+    address public migrationEmergencyKey;
+    address public pendingMigrationEmergencyKey;
+
+    enum SubscriptionPlan { FREE, STANDARD, PREMIUM }
+
+    struct Subscription { SubscriptionPlan plan; uint64 expiresAt; }
+    struct PlanConfig {
+        address paymentToken;
+        uint256 price;
+        uint64 period;
+        bool enabled;
+    }
+
+    mapping(address => Subscription) public subscriptions;
+    mapping(SubscriptionPlan => PlanConfig) public planConfigs;
+    address public treasury;
+
+    bytes32 public appVersionHash;
+    mapping(address => bool) public approvedTradingPlatform;
+    address public p2pAdmin;
+    address public p2pDAO;
+    uint64 public p2pTimeout;
+
+    // ---------- События ----------
+
+    event TransferExecuted(address indexed wallet, address indexed token, address indexed recipient, uint256 amount, uint256 nonce);
+    event NativeTransferExecuted(address indexed wallet, address indexed recipient, uint256 amount, uint256 nonce);
+    event SwapExecuted(address indexed wallet, address indexed adapter, address indexed tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut, address recipient, uint256 nonce);
+    event WhitelistUpdated(address indexed recipient, address indexed token, uint256 limit, uint256 deadline, bool active);
+    event AdapterUpdated(address indexed adapter, address indexed token, uint256 limit, uint256 deadline, bool active);
+    event BlacklistUpdated(address indexed target, bool active);
+    event HotWalletUpdated(address indexed wallet, bool active);
+    event ColdWalletUpdated(address indexed wallet, bool active);
+    event TokenUpdated(address indexed token, bool active);
+    event RouterUpdated(address indexed router, bool active);
+    event RecoveryTargetUpdated(address indexed wallet, address indexed token, address indexed recipient, bool active);
+    event EmergencySweepExecuted(address indexed wallet, address indexed token, address indexed recipient, uint256 amount);
+    event OwnerChanged(address indexed owner, bool isHot, bool active);
+    event MigratedOut(address indexed newGuard);
+    event MigrationAccepted(address indexed oldGuard);
+    event MigrationProposed(address indexed oldGuard, address indexed newGuard, bytes32 migrationDataHash, uint256 executeAfter);
+    event MigrationCancelled(address indexed oldGuard, address indexed newGuard, uint256 cancelCount);
+    event MigrationFinalized(address indexed oldGuard, address indexed newGuard);
+    event MigrationEmergencyKeyProposed(address indexed current, address indexed pending);
+    event MigrationEmergencyKeyChanged(address indexed oldKey, address indexed newKey);
+    event MigrationEmergencyKeyCancelled(address indexed current);
+    event WalletGuardMigrationProposed(address indexed wallet, address indexed newGuard);
+    event WalletGuardMigrationAccepted(address indexed wallet);
+    event WalletPermit2Enabled(address indexed wallet, address indexed token);
+    event WalletPermit2Revoked(address indexed wallet, address indexed token);
+
+    event Subscribed(address indexed account, SubscriptionPlan plan, address paymentToken, uint256 price, uint64 expiresAt);
+    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+    event PlanConfigUpdated(SubscriptionPlan plan, address paymentToken, uint256 price, uint64 period, bool enabled);
+    event AppVersionUpdated(bytes32 indexed oldHash, bytes32 indexed newHash);
+    event TradingPlatformUpdated(address indexed platform, bool active);
+    event P2PConfigUpdated(address indexed admin, address indexed dao, uint64 timeout);
+
+    modifier notMigrated() { require(!migratedOut, "migrated out"); _; }
+
+    constructor(
+        address _mainWallet,
+        address[] memory _owners,
+        bool[] memory _isHot,
+        IPermit2 _permit2,
+        address _expectedOldGuard
+    ) {
+        require(_mainWallet != address(0), "zero main");
+        require(_owners.length == TOTAL_OWNERS, "need 5");
+        require(_isHot.length == TOTAL_OWNERS, "need 5 flags");
+        require(address(_permit2) != address(0), "zero permit2");
+
+        mainWallet = _mainWallet;
+        permit2 = address(_permit2);
+        expectedOldGuard = _expectedOldGuard;
+
+        DOMAIN_SEPARATOR = keccak256(abi.encode(
+            DOMAIN_TYPEHASH,
+            keccak256("SmartWalletGuard"),
+            keccak256(bytes(VERSION)),
+            block.chainid,
+            address(this)
+        ));
+
+        uint256 hotCount;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            address o = _owners[i];
+            require(o != address(0), "zero owner");
+            require(!ownerInfo[o].isOwner, "dup");
+            ownerInfo[o] = OwnerInfo(true, _isHot[i]);
+            owners.push(o);
+            if (_isHot[i]) hotCount++;
+        }
+        require(hotCount == HOT_OWNERS, "need 3 hot");
+    }
+
+    // =========================================================================
+    // EIP-712 helpers
+    // =========================================================================
+
+    function _hashTypedData(bytes32 structHash) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+    function _hashAddressArray(address[] calldata values) internal pure returns (bytes32) {
+        bytes memory e = new bytes(values.length * 32);
+        for (uint256 i = 0; i < values.length; i++) {
+            uint256 v = uint256(uint160(values[i]));
+            assembly { mstore(add(add(e, 32), mul(i, 32)), v) }
+        }
+        return keccak256(e);
+    }
+    function _hashBoolArray(bool[] calldata values) internal pure returns (bytes32) {
+        bytes memory e = new bytes(values.length * 32);
+        for (uint256 i = 0; i < values.length; i++) {
+            uint256 v = values[i] ? 1 : 0;
+            assembly { mstore(add(add(e, 32), mul(i, 32)), v) }
+        }
+        return keccak256(e);
+    }
+    function _recover(bytes32 digest, bytes calldata sig) internal pure returns (address) {
+        require(sig.length == 65, "bad sig length");
+        bytes32 r; bytes32 s; uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        require(v == 27 || v == 28, "bad v");
+        require(uint256(s) <= uint256(SECP256K1N_HALF), "high-s");
+        address signer = ecrecover(digest, v, r, s);
+        require(signer != address(0), "invalid sig");
+        return signer;
+    }
+    function _verifySignatures(
+        bytes32 digest, bytes[] calldata sigs, uint256 threshold, bool requireCold
+    ) internal view returns (bool) {
+        if (sigs.length < threshold) return false;
+        require(sigs.length <= TOTAL_OWNERS, "too many sigs");
+        address[] memory seen = new address[](sigs.length);
+        uint256 coldValid;
+        for (uint256 i = 0; i < sigs.length; i++) {
+            address s = _recover(digest, sigs[i]);
+            OwnerInfo memory info = ownerInfo[s];
+            if (!info.isOwner) return false;
+            for (uint256 j = 0; j < i; j++) {
+                if (seen[j] == s) return false;
+            }
+            seen[i] = s;
+            if (!info.isHot) coldValid++;
+        }
+        if (requireCold && coldValid == 0) return false;
+        return true;
+    }
+
+    // =========================================================================
+    // Internal
+    // =========================================================================
+
+    function _consumeNonce(address w, uint256 n) internal {
+        require(!usedNonces[w][n], "nonce used");
+        usedNonces[w][n] = true;
+    }
+    function _checkDeadline(uint256 d) internal view { require(block.timestamp <= d, "expired"); }
+    function _checkPermit2Allowance(address w, address token, uint256 amount) internal view {
+        (uint160 allowed, uint48 exp, ) = IPermit2(permit2).allowance(w, token, address(this));
+        require(uint256(allowed) >= amount, "insufficient permit2 allowance");
+        require(uint256(exp) >= block.timestamp, "permit2 allowance expired");
+    }
+    function _checkNotPaused(address w) internal view {
+        require(!ISmartWallet(w).paused(), "wallet paused");
+    }
+    function _checkRecipient(address r) internal view {
+        require(r != address(0), "zero recipient");
+        require(!blacklist[r], "blacklisted");
+    }
+    function _isRegisteredWallet(address w) internal view returns (bool) {
+        return hotWallets[w] || coldWallets[w];
+    }
+    function _checkWalletGuard(address w) internal view {
+        require(ISmartWallet(w).guard() == address(this), "wallet not ours");
+    }
+
+    // =========================================================================
+    // Subscription / permissions
+    // =========================================================================
+
+    function _planMask(SubscriptionPlan p) internal pure returns (uint256) {
+        if (p == SubscriptionPlan.FREE) {
+            return PERM_APP_VERIFY | PERM_EMERGENCY;
+        }
+        return PERM_APP_VERIFY | PERM_EMERGENCY | PERM_COLD_WARM
+             | PERM_P2P | PERM_SECURITY | PERM_TRADING;
+    }
+
+    function activePlan() public view returns (SubscriptionPlan) {
+        Subscription memory s = subscriptions[mainWallet];
+        if (s.expiresAt == 0 || block.timestamp >= s.expiresAt) return SubscriptionPlan.FREE;
+        return s.plan;
+    }
+
+    function hasPermission(uint256 perm) public view returns (bool) {
+        return (_planMask(activePlan()) & perm) != 0;
+    }
+    function hasPermission(address account, uint256 perm) external view returns (bool) {
+        if (account != mainWallet) return false;
+        return (_planMask(activePlan()) & perm) != 0;
+    }
+
+    function getSubscription() external view returns (SubscriptionPlan plan, uint64 expiresAt) {
+        Subscription memory s = subscriptions[mainWallet];
+        expiresAt = s.expiresAt;
+        plan = activePlan();
+    }
+    function getRawSubscription() external view returns (uint8 plan, uint64 expiresAt) {
+        Subscription memory s = subscriptions[mainWallet];
+        return (uint8(s.plan), s.expiresAt);
+    }
+    function getPlanConfig(SubscriptionPlan plan)
+        external view
+        returns (address paymentToken, uint256 price, uint64 period, bool enabled)
+    {
+        PlanConfig memory c = planConfigs[plan];
+        return (c.paymentToken, c.price, c.period, c.enabled);
+    }
+
+    // =========================================================================
+    // ERC20 transfer (2/3 Hot)
+    // =========================================================================
+
+    function transfer(
+        address hotWallet, address token, address recipient, uint256 amount,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        require(hotWallets[hotWallet], "not hot wallet");
+        require(amount > 0 && amount <= type(uint160).max, "bad amount");
+        _checkWalletGuard(hotWallet);
+        _checkRecipient(recipient);
+        require(!blacklist[token], "token blacklisted");
+        require(approvedToken[token], "token not approved");
+        _checkNotPaused(hotWallet);
+        _checkDeadline(deadline);
+        _consumeNonce(hotWallet, nonce);
+
+        WhitelistEntry storage w = whitelist[recipient][token];
+        require(w.exists, "not whitelisted");
+        require(block.timestamp <= w.deadline, "whitelist deadline expired");
+        require(w.remaining >= amount, "limit exceeded");
+
+        _checkPermit2Allowance(hotWallet, token, amount);
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            TRANSFER_TYPEHASH, hotWallet, token, recipient, amount, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        w.remaining -= amount;
+        IPermit2(permit2).transferFrom(hotWallet, recipient, uint160(amount), token);
+        emit TransferExecuted(hotWallet, token, recipient, amount, nonce);
+    }
+
+    function transferNative(
+        address hotWallet, address payable recipient, uint256 amount,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        require(hotWallets[hotWallet], "not hot wallet");
+        require(amount > 0, "bad amount");
+        _checkWalletGuard(hotWallet);
+        _checkRecipient(recipient);
+        _checkNotPaused(hotWallet);
+        _checkDeadline(deadline);
+        _consumeNonce(hotWallet, nonce);
+
+        WhitelistEntry storage w = whitelist[recipient][NATIVE];
+        require(w.exists, "native not whitelisted");
+        require(block.timestamp <= w.deadline, "whitelist deadline expired");
+        require(w.remaining >= amount, "limit exceeded");
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            NATIVE_TRANSFER_TYPEHASH, hotWallet, recipient, amount, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        w.remaining -= amount;
+        ISmartWallet(hotWallet).sendNativeByGuard(recipient, amount);
+        emit NativeTransferExecuted(hotWallet, recipient, amount, nonce);
+    }
+
+    // =========================================================================
+    // Swap (2/3 Hot)
+    // =========================================================================
+
+    /// @dev Whitelist для (recipient, tokenOut) — сознательное расширение ТЗ §23
+    ///      для жёсткого лимита на получателя swap. Пост-условие
+    ///      `actualOut <= remaining` гарантирует, что лимит не превышается
+    ///      даже при favorable slippage. Клиент обязан ставить minAmountOut
+    ///      с учётом возможного overshoot.
+    function executeSwap(
+        address hotWallet, address adapter, address tokenIn, address tokenOut,
+        uint256 amountIn, uint256 minAmountOut, address recipient, bytes calldata adapterData,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        require(hotWallets[hotWallet], "not hot wallet");
+        require(amountIn > 0 && amountIn <= type(uint160).max, "bad amount");
+        require(tokenIn != address(0) && tokenOut != address(0), "zero token");
+        require(tokenIn != tokenOut, "same token");
+        require(adapter.code.length > 0, "adapter not contract");
+        _checkWalletGuard(hotWallet);
+        _checkRecipient(recipient);
+        require(!blacklist[adapter], "adapter blacklisted");
+        require(!blacklist[tokenIn], "tokenIn blacklisted");
+        require(!blacklist[tokenOut], "tokenOut blacklisted");
+        require(approvedToken[tokenIn], "tokenIn not approved");
+        require(approvedToken[tokenOut], "tokenOut not approved");
+
+        WhitelistEntry storage wr = whitelist[recipient][tokenOut];
+        require(wr.exists, "recipient not whitelisted for tokenOut");
+        require(block.timestamp <= wr.deadline, "recipient deadline expired");
+        require(wr.remaining >= minAmountOut, "recipient limit exceeded");
+
+        require(ISwapAdapter(adapter).guard() == address(this), "wrong adapter guard");
+        address router = ISwapAdapter(adapter).router();
+        require(approvedRouter[router], "router not approved");
+        require(!blacklist[router], "router blacklisted");
+
+        _checkNotPaused(hotWallet);
+        _checkDeadline(deadline);
+        _consumeNonce(hotWallet, nonce);
+
+        AdapterPolicy storage p = adapterPolicy[adapter][tokenIn];
+        require(p.exists, "adapter not whitelisted");
+        require(block.timestamp <= p.deadline, "adapter deadline expired");
+        require(p.remaining >= amountIn, "adapter limit exceeded");
+
+        _checkPermit2Allowance(hotWallet, tokenIn, amountIn);
+
+        uint256 beforeOut = IERC20(tokenOut).balanceOf(recipient);
+        bytes32 adapterDataHash = keccak256(adapterData);
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            SWAP_TYPEHASH, hotWallet, adapter, tokenIn, tokenOut, amountIn,
+            minAmountOut, recipient, adapterDataHash, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        p.remaining -= amountIn;
+        IPermit2(permit2).transferFrom(hotWallet, adapter, uint160(amountIn), tokenIn);
+        ISwapAdapter(adapter).swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, adapterData);
+
+        uint256 actualOut = IERC20(tokenOut).balanceOf(recipient) - beforeOut;
+        require(actualOut >= minAmountOut, "insufficient output");
+        require(actualOut <= wr.remaining, "recipient limit exceeded (post)");
+        wr.remaining -= actualOut;
+
+        emit SwapExecuted(hotWallet, adapter, tokenIn, tokenOut, amountIn, actualOut, recipient, nonce);
+    }
+
+    // =========================================================================
+    // Whitelist ops
+    // =========================================================================
+
+    function addWhitelist(
+        address recipient, address token, uint256 limit, uint256 whitelistDeadline,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(recipient != address(0), "zero recipient");
+        require(limit > 0, "zero limit");
+        require(whitelistDeadline >= block.timestamp, "expired whitelist");
+        require(!whitelist[recipient][token].exists, "exists");
+        require(!blacklist[recipient], "blacklisted");
+        if (token != NATIVE) require(approvedToken[token], "token not approved");
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            WHITELIST_TYPEHASH, uint8(2), recipient, token, limit, whitelistDeadline, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        whitelist[recipient][token] = WhitelistEntry(true, limit, limit, whitelistDeadline);
+        emit WhitelistUpdated(recipient, token, limit, whitelistDeadline, true);
+    }
+
+    function removeWhitelist(address recipient, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(whitelist[recipient][token].exists, "not whitelisted");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            WHITELIST_TYPEHASH, uint8(3), recipient, token, uint256(0), uint256(0), nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        delete whitelist[recipient][token];
+        emit WhitelistUpdated(recipient, token, 0, 0, false);
+    }
+
+    function increaseWhitelistLimit(
+        address recipient, address token, uint256 newLimit,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        WhitelistEntry storage w = whitelist[recipient][token];
+        require(w.exists, "not whitelisted");
+        require(newLimit > w.limit, "must increase");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            WHITELIST_TYPEHASH, uint8(4), recipient, token, newLimit, w.deadline, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        uint256 spent = w.limit - w.remaining;
+        w.limit = newLimit;
+        w.remaining = newLimit - spent;
+        emit WhitelistUpdated(recipient, token, newLimit, w.deadline, true);
+    }
+
+    function changeWhitelistDeadline(
+        address recipient, address token, uint256 newDeadline,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newDeadline >= block.timestamp, "expired deadline");
+        WhitelistEntry storage w = whitelist[recipient][token];
+        require(w.exists, "not whitelisted");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            WHITELIST_TYPEHASH, uint8(5), recipient, token, w.limit, newDeadline, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        w.deadline = newDeadline;
+        emit WhitelistUpdated(recipient, token, w.limit, newDeadline, true);
+    }
+
+    // =========================================================================
+    // Adapter ops
+    // =========================================================================
+
+    function addAdapter(
+        address adapter, address token, uint256 limit, uint256 adapterDeadline,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(!adapterPolicy[adapter][token].exists, "exists");
+        require(adapter.code.length > 0, "not contract");
+        require(!blacklist[adapter], "blacklisted");
+        require(approvedToken[token], "token not approved");
+        require(limit > 0, "zero limit");
+        require(adapterDeadline >= block.timestamp, "expired adapter deadline");
+        require(ISwapAdapter(adapter).guard() == address(this), "wrong guard");
+        address router = ISwapAdapter(adapter).router();
+        require(approvedRouter[router], "router not approved");
+        require(!blacklist[router], "router blacklisted");
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            ADAPTER_TYPEHASH, uint8(6), adapter, token, limit, adapterDeadline, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        adapterPolicy[adapter][token] = AdapterPolicy(true, limit, limit, adapterDeadline);
+        emit AdapterUpdated(adapter, token, limit, adapterDeadline, true);
+    }
+
+    function removeAdapter(address adapter, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(adapterPolicy[adapter][token].exists, "not whitelisted");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            ADAPTER_TYPEHASH, uint8(7), adapter, token, uint256(0), uint256(0), nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        delete adapterPolicy[adapter][token];
+        emit AdapterUpdated(adapter, token, 0, 0, false);
+    }
+
+    function increaseAdapterLimit(
+        address adapter, address token, uint256 newLimit,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        AdapterPolicy storage p = adapterPolicy[adapter][token];
+        require(p.exists, "not whitelisted");
+        require(newLimit > p.limit, "must increase");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            ADAPTER_TYPEHASH, uint8(8), adapter, token, newLimit, p.deadline, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        uint256 spent = p.limit - p.remaining;
+        p.limit = newLimit;
+        p.remaining = newLimit - spent;
+        emit AdapterUpdated(adapter, token, newLimit, p.deadline, true);
+    }
+
+    function changeAdapterDeadline(
+        address adapter, address token, uint256 newDeadline,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newDeadline >= block.timestamp, "expired deadline");
+        AdapterPolicy storage p = adapterPolicy[adapter][token];
+        require(p.exists, "not whitelisted");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            ADAPTER_TYPEHASH, uint8(9), adapter, token, p.limit, newDeadline, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        p.deadline = newDeadline;
+        emit AdapterUpdated(adapter, token, p.limit, newDeadline, true);
+    }
+
+    // =========================================================================
+    // Blacklist
+    // =========================================================================
+
+    function addBlacklist(address target, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(!blacklist[target], "already");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(BLACKLIST_TYPEHASH, uint8(10), target, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        blacklist[target] = true;
+        emit BlacklistUpdated(target, true);
+    }
+
+    function removeBlacklist(address target, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(blacklist[target], "not blacklisted");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(BLACKLIST_TYPEHASH, uint8(11), target, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        blacklist[target] = false;
+        emit BlacklistUpdated(target, false);
+    }
+
+    // =========================================================================
+    // Token / Router
+    // =========================================================================
+
+    function addToken(address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(token.code.length > 0, "not contract");
+        require(!approvedToken[token], "already approved");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(TOKEN_TYPEHASH, uint8(14), token, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        approvedToken[token] = true;
+        emit TokenUpdated(token, true);
+    }
+
+    function removeToken(address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(approvedToken[token], "not approved");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(TOKEN_TYPEHASH, uint8(15), token, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        approvedToken[token] = false;
+        emit TokenUpdated(token, false);
+    }
+
+    function addRouter(address router, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(router.code.length > 0, "not contract");
+        require(!approvedRouter[router], "already approved");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(ROUTER_TYPEHASH, uint8(16), router, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        approvedRouter[router] = true;
+        emit RouterUpdated(router, true);
+    }
+
+    function removeRouter(address router, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(approvedRouter[router], "not approved");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(ROUTER_TYPEHASH, uint8(17), router, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        approvedRouter[router] = false;
+        emit RouterUpdated(router, false);
+    }
+
+    // =========================================================================
+    // Hot / Cold wallets
+    // =========================================================================
+
+    function addHotWallet(address w, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external nonReentrant notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(w != address(0), "zero wallet");
+        require(w.code.length > 0, "bad wallet");
+        require(!hotWallets[w], "already hot");
+        require(!coldWallets[w], "already cold");
+        require(ISmartWallet(w).guard() == address(this), "wrong guard");
+        require(ISmartWallet(w).permit2() == permit2, "wrong permit2");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(HOTWALLET_TYPEHASH, uint8(12), w, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        hotWallets[w] = true;
+        emit HotWalletUpdated(w, true);
+    }
+
+    function removeHotWallet(address w, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(hotWallets[w], "not hot wallet");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(HOTWALLET_TYPEHASH, uint8(13), w, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        hotWallets[w] = false;
+        emit HotWalletUpdated(w, false);
+    }
+
+    function addColdWallet(address w, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external nonReentrant notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(w != address(0), "zero wallet");
+        require(w.code.length > 0, "bad wallet");
+        require(!coldWallets[w], "already cold");
+        require(!hotWallets[w], "already hot");
+        require(ISmartWallet(w).guard() == address(this), "wrong guard");
+        require(ISmartWallet(w).permit2() == permit2, "wrong permit2");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(COLDWALLET_TYPEHASH, uint8(18), w, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        coldWallets[w] = true;
+        emit ColdWalletUpdated(w, true);
+    }
+
+    function removeColdWallet(address w, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(coldWallets[w], "not cold wallet");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(COLDWALLET_TYPEHASH, uint8(19), w, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        coldWallets[w] = false;
+        emit ColdWalletUpdated(w, false);
+    }
+
+    // =========================================================================
+    // Recovery targets + emergency sweep
+    // =========================================================================
+
+    function setRecoveryTarget(
+        address w, address token, address recipient,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(_isRegisteredWallet(w), "unknown wallet");
+        require(recipient != address(0), "zero recipient");
+        require(!blacklist[recipient], "recipient blacklisted");
+        if (token != NATIVE) require(approvedToken[token], "token not approved");
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            RECOVERY_TARGET_TYPEHASH, uint8(20), w, token, recipient, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        recoveryTargets[w][token] = RecoveryTarget(true, recipient);
+        emit RecoveryTargetUpdated(w, token, recipient, true);
+    }
+
+    function removeRecoveryTarget(
+        address w, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(recoveryTargets[w][token].exists, "no target");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            RECOVERY_TARGET_TYPEHASH, uint8(21), w, token, address(0), nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        delete recoveryTargets[w][token];
+        emit RecoveryTargetUpdated(w, token, address(0), false);
+    }
+
+    /// @dev v5.1.8: `_checkWalletGuard` добавлен для консистентности.
+    function emergencySweep(
+        address w, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        require(_isRegisteredWallet(w), "unknown wallet");
+        _checkWalletGuard(w); // v5.1.8
+        require(ISmartWallet(w).paused(), "not paused");
+        if (token != NATIVE) require(!blacklist[token], "token blacklisted");
+
+        RecoveryTarget memory rt = recoveryTargets[w][token];
+        require(rt.exists, "no recovery target");
+        require(!blacklist[rt.recipient], "recovery recipient blacklisted");
+
+        _checkDeadline(deadline);
+        _consumeNonce(w, nonce);
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            EMERGENCY_SWEEP_TYPEHASH, w, token, rt.recipient, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid emergency sweep sigs");
+
+        uint256 amount;
+        if (token == NATIVE) {
+            amount = w.balance;
+            require(amount > 0, "zero native");
+            ISmartWallet(w).sendNativeByGuard(payable(rt.recipient), amount);
+        } else {
+            amount = IERC20(token).balanceOf(w);
+            require(amount > 0, "zero token");
+            ISmartWallet(w).emergencyEnablePermit2ForGuard(token);
+            _checkPermit2Allowance(w, token, amount);
+            IPermit2(permit2).transferFrom(w, rt.recipient, uint160(amount), token);
+        }
+        emit EmergencySweepExecuted(w, token, rt.recipient, amount);
+    }
+
+    // =========================================================================
+    // Change owners (3/5 + cold)
+    // =========================================================================
+
+    function changeOwners(
+        address[] calldata newOwners, bool[] calldata newIsHot,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newOwners.length == TOTAL_OWNERS, "need 5");
+        require(newIsHot.length == TOTAL_OWNERS, "need 5 flags");
+
+        uint256 hotCount;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            require(newOwners[i] != address(0), "zero owner");
+            for (uint256 j = 0; j < i; j++) require(newOwners[j] != newOwners[i], "dup");
+            if (newIsHot[i]) hotCount++;
+        }
+        require(hotCount == HOT_OWNERS, "need 3 hot");
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            OWNERS_TYPEHASH, mainWallet,
+            _hashAddressArray(newOwners), _hashBoolArray(newIsHot),
+            nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid critical sigs");
+
+        for (uint256 i = 0; i < owners.length; i++) {
+            ownerInfo[owners[i]] = OwnerInfo(false, false);
+            emit OwnerChanged(owners[i], false, false);
+        }
+        delete owners;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            ownerInfo[newOwners[i]] = OwnerInfo(true, newIsHot[i]);
+            owners.push(newOwners[i]);
+            emit OwnerChanged(newOwners[i], newIsHot[i], true);
+        }
+    }
+
+    // =========================================================================
+    // Migration
+    // =========================================================================
+
+    function proposeMigration(
+        address newGuard, bytes32 migrationDataHash,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newGuard != address(0), "zero");
+        require(newGuard != address(this), "same");
+        require(newGuard.code.length > 0, "not contract");
+        require(!pendingMigration.pending, "pending");
+        require(
+            migrationCancelCount[mainWallet][newGuard] < MAX_MIGRATION_CANCELS,
+            "max cancels reached, use emergency path"
+        );
+
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            MIGRATION_TYPEHASH, mainWallet, newGuard, migrationDataHash, nonce, executeAfter, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid migration sigs");
+
+        pendingMigration = Migration(newGuard, migrationDataHash, block.timestamp, executeAfter, 0, true);
+        emit MigrationProposed(address(this), newGuard, migrationDataHash, executeAfter);
+    }
+
+    function cancelMigration(uint256 nonce, uint256 deadline, bytes[] calldata signatures) external notMigrated {
+        require(pendingMigration.pending, "no migration");
+        require(block.timestamp < pendingMigration.executeAfter, "timelock passed");
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        address newGuard = pendingMigration.newGuard;
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            CANCEL_MIGRATION_TYPEHASH, mainWallet, newGuard, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid cancel sigs");
+
+        uint256 newCount = migrationCancelCount[mainWallet][newGuard] + 1;
+        migrationCancelCount[mainWallet][newGuard] = newCount;
+
+        delete pendingMigration;
+        emit MigrationCancelled(address(this), newGuard, newCount);
+    }
+
+    function proposeMigrationWithEmergency(
+        address newGuard, bytes32 migrationDataHash,
+        uint256 nonce, uint256 deadline,
+        bytes calldata emergencySignature, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newGuard != address(0), "zero");
+        require(newGuard != address(this), "same");
+        require(newGuard.code.length > 0, "not contract");
+        require(!pendingMigration.pending, "pending");
+        require(migrationCancelCount[mainWallet][newGuard] >= MAX_MIGRATION_CANCELS, "not unlocked");
+
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            MIGRATION_EMERGENCY_TYPEHASH, mainWallet, newGuard, migrationDataHash, nonce, executeAfter, deadline)));
+
+        if (migrationEmergencyKey != address(0)) {
+            require(
+                _recover(digest, emergencySignature) == migrationEmergencyKey,
+                "invalid emergency key"
+            );
+        }
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid migration sigs");
+
+        pendingMigration = Migration(newGuard, migrationDataHash, block.timestamp, executeAfter, 0, true);
+        emit MigrationProposed(address(this), newGuard, migrationDataHash, executeAfter);
+    }
+
+    /// @dev v5.1.8: сохраняет migratedTo для последующего proposeWalletGuardMigration.
+    function finalizeMigration(bytes calldata migrationData) external nonReentrant notMigrated {
+        require(pendingMigration.pending, "no migration");
+        require(block.timestamp >= pendingMigration.executeAfter, "timelock active");
+        bytes32 dataHash = keccak256(migrationData);
+        require(dataHash == pendingMigration.migrationDataHash, "data hash mismatch");
+
+        address newGuard = pendingMigration.newGuard;
+        migratedOut = true;
+        migratedTo = newGuard; // v5.1.8
+        delete pendingMigration;
+
+        IGuardMigration(newGuard).acceptMigration(address(this), mainWallet, dataHash, migrationData);
+        emit MigrationFinalized(address(this), newGuard);
+        emit MigratedOut(newGuard);
+    }
+
+    // ---------- Wallet migration helpers ----------
+
+    /// @dev v5.1.8: работает и до, и после finalizeMigration.
+    ///      До finalize: newGuard == pendingMigration.newGuard.
+    ///      После finalize: newGuard == migratedTo.
+    function proposeWalletGuardMigration(address wallet, address newGuard)
+        external nonReentrant
+    {
+        address approvedNewGuard;
+        if (pendingMigration.pending) {
+            approvedNewGuard = pendingMigration.newGuard;
+        } else if (migratedOut && migratedTo != address(0)) {
+            approvedNewGuard = migratedTo;
+        } else {
+            revert("no approved migration");
+        }
+        require(newGuard == approvedNewGuard, "guard != approved");
+        require(_isRegisteredWallet(wallet), "unknown wallet");
+        require(wallet.code.length > 0, "wallet not contract");
+        require(ISmartWallet(wallet).guard() == address(this), "not our wallet");
+        require(ISmartWallet(wallet).permit2() == permit2, "wrong permit2");
+
+        ISmartWallet(wallet).proposeGuardMigration(newGuard);
+        emit WalletGuardMigrationProposed(wallet, newGuard);
+    }
+
+    function acceptWalletGuardMigration(address wallet) external nonReentrant {
+        require(migrationAccepted, "not migrated in");
+        require(!migratedOut, "migrated out");
+        require(_isRegisteredWallet(wallet), "unknown wallet");
+        require(wallet.code.length > 0, "wallet not contract");
+
+        require(ISmartWallet(wallet).guard() == expectedOldGuard, "wallet not old guard");
+        ISmartWallet(wallet).acceptGuardMigration();
+        require(ISmartWallet(wallet).guard() == address(this), "wallet migration failed");
+
+        emit WalletGuardMigrationAccepted(wallet);
+    }
+
+    function enablePermit2OnWallet(address wallet, address token) external nonReentrant {
+        require(migrationAccepted, "not migrated in");
+        require(!migratedOut, "migrated out");
+        require(_isRegisteredWallet(wallet), "unknown wallet");
+        require(ISmartWallet(wallet).guard() == address(this), "wallet not migrated");
+        require(approvedToken[token], "token not approved");
+        require(token != NATIVE, "native uses no permit2");
+
+        ISmartWallet(wallet).emergencyEnablePermit2ForGuard(token);
+        emit WalletPermit2Enabled(wallet, token);
+    }
+
+    function revokePermit2OnWallet(
+        address wallet, address token,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant {
+        require(migrationAccepted, "not migrated in");
+        require(!migratedOut, "migrated out");
+        require(_isRegisteredWallet(wallet), "unknown wallet");
+        require(ISmartWallet(wallet).guard() == address(this), "wallet not migrated");
+        require(token != NATIVE, "native uses no permit2");
+
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            REVOKE_PERMIT2_ON_WALLET_TYPEHASH, mainWallet, wallet, token, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        ISmartWallet(wallet).revokePermit2ForGuard(token);
+        emit WalletPermit2Revoked(wallet, token);
+    }
+
+    // ---------- Migration emergency key ----------
+
+    function proposeMigrationEmergencyKey(
+        address newKey, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newKey != address(0), "zero");
+        require(newKey.code.length == 0, "must be EOA");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            MIGRATION_EMERGENCY_KEY_TYPEHASH, mainWallet, newKey, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid critical sigs");
+        pendingMigrationEmergencyKey = newKey;
+        emit MigrationEmergencyKeyProposed(migrationEmergencyKey, newKey);
+    }
+
+    function acceptMigrationEmergencyKey() external {
+        require(msg.sender == pendingMigrationEmergencyKey, "not pending");
+        address old = migrationEmergencyKey;
+        migrationEmergencyKey = pendingMigrationEmergencyKey;
+        pendingMigrationEmergencyKey = address(0);
+        emit MigrationEmergencyKeyChanged(old, migrationEmergencyKey);
+    }
+
+    function cancelMigrationEmergencyKey(
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(pendingMigrationEmergencyKey != address(0), "no pending");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            MIGRATION_EMERGENCY_KEY_TYPEHASH, mainWallet, address(0), nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid critical sigs");
+        pendingMigrationEmergencyKey = address(0);
+        emit MigrationEmergencyKeyCancelled(migrationEmergencyKey);
+    }
+
+    // =========================================================================
+    // Subscription (2/3 Hot)
+    // =========================================================================
+
+    function subscribe(
+        SubscriptionPlan plan, address fromWallet,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        require(plan == SubscriptionPlan.STANDARD || plan == SubscriptionPlan.PREMIUM, "bad plan");
+        require(treasury != address(0), "treasury not set");
+
+        PlanConfig memory cfg = planConfigs[plan];
+        require(cfg.enabled, "plan disabled");
+        require(cfg.paymentToken != address(0), "no payment token");
+        require(cfg.price > 0, "no price");
+        require(cfg.period > 0, "no period");
+        require(approvedToken[cfg.paymentToken], "payment token not approved");
+        require(!blacklist[cfg.paymentToken], "payment token blacklisted");
+
+        require(_isRegisteredWallet(fromWallet), "bad wallet");
+        _checkWalletGuard(fromWallet);
+        _checkNotPaused(fromWallet);
+        _checkDeadline(deadline);
+        _consumeNonce(fromWallet, nonce);
+        _checkPermit2Allowance(fromWallet, cfg.paymentToken, cfg.price);
+
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            SUBSCRIBE_TYPEHASH, mainWallet, uint8(plan),
+            cfg.paymentToken, cfg.price, fromWallet, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+
+        Subscription memory s = subscriptions[mainWallet];
+        uint64 newExpiry;
+        if (s.expiresAt > block.timestamp && s.plan == plan) {
+            newExpiry = s.expiresAt + cfg.period;
+        } else {
+            newExpiry = uint64(block.timestamp) + cfg.period;
+        }
+        subscriptions[mainWallet] = Subscription(plan, newExpiry);
+
+        IPermit2(permit2).transferFrom(fromWallet, treasury, uint160(cfg.price), cfg.paymentToken);
+        emit Subscribed(mainWallet, plan, cfg.paymentToken, cfg.price, newExpiry);
+    }
+
+    // =========================================================================
+    // Platform config
+    // =========================================================================
+
+    function setTreasury(address newTreasury, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newTreasury != address(0), "zero treasury");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            SET_TREASURY_TYPEHASH, mainWallet, newTreasury, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid critical sigs");
+        address old = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(old, newTreasury);
+    }
+
+    function setPlanConfig(
+        SubscriptionPlan plan, address paymentToken, uint256 price, uint64 period, bool enabled,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(plan != SubscriptionPlan.FREE, "FREE not configurable");
+        require(price <= type(uint160).max, "price > uint160");
+        if (enabled) {
+            require(paymentToken != address(0), "zero token");
+            require(paymentToken.code.length > 0, "token not contract");
+            require(approvedToken[paymentToken], "token not approved");
+            require(!blacklist[paymentToken], "payment token blacklisted");
+            require(price > 0, "zero price");
+            require(period > 0, "zero period");
+        }
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            SET_PLAN_CONFIG_TYPEHASH, mainWallet, uint8(plan),
+            paymentToken, price, period, enabled, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid critical sigs");
+        planConfigs[plan] = PlanConfig(paymentToken, price, period, enabled);
+        emit PlanConfigUpdated(plan, paymentToken, price, period, enabled);
+    }
+
+    function setAppVersionHash(bytes32 newHash, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            SET_APP_VERSION_TYPEHASH, mainWallet, newHash, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        bytes32 old = appVersionHash;
+        appVersionHash = newHash;
+        emit AppVersionUpdated(old, newHash);
+    }
+
+    function addTradingPlatform(address platform, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(platform != address(0) && platform.code.length > 0, "bad platform");
+        require(!approvedTradingPlatform[platform], "already");
+        require(!blacklist[platform], "blacklisted");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            TRADING_PLATFORM_TYPEHASH, uint8(30), platform, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        approvedTradingPlatform[platform] = true;
+        emit TradingPlatformUpdated(platform, true);
+    }
+
+    function removeTradingPlatform(address platform, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(approvedTradingPlatform[platform], "not approved");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            TRADING_PLATFORM_TYPEHASH, uint8(31), platform, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, HOT_THRESHOLD, false), "invalid sigs");
+        approvedTradingPlatform[platform] = false;
+        emit TradingPlatformUpdated(platform, false);
+    }
+
+    function setP2PConfig(
+        address newAdmin, address newDAO, uint64 newTimeout,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        _checkDeadline(deadline);
+        _consumeNonce(mainWallet, nonce);
+        require(newTimeout > 0, "zero timeout");
+        bytes32 digest = _hashTypedData(keccak256(abi.encode(
+            SET_P2P_CONFIG_TYPEHASH, mainWallet, newAdmin, newDAO, newTimeout, nonce, deadline)));
+        require(_verifySignatures(digest, signatures, CRITICAL_THRESHOLD, true), "invalid critical sigs");
+        p2pAdmin = newAdmin;
+        p2pDAO = newDAO;
+        p2pTimeout = newTimeout;
+        emit P2PConfigUpdated(newAdmin, newDAO, newTimeout);
+    }
+
+    // =========================================================================
+    // acceptMigration
+    // =========================================================================
+
+    struct WhitelistMigrationEntry { address recipient; address token; uint256 limit; uint256 remaining; uint256 deadline; }
+    struct RecoveryTargetMigrationEntry { address wallet; address token; address recipient; }
+    struct PlanConfigMigrationEntry {
+        uint8 plan;
+        address paymentToken;
+        uint256 price;
+        uint64 period;
+        bool enabled;
+    }
+
+    struct MigrationData {
+        address[] newOwners;
+        bool[] newIsHot;
+        address[] hotWallets;
+        address[] coldWallets;
+        address[] approvedTokens;
+        address[] approvedRouters;
+        address[] blacklistAddrs;
+        WhitelistMigrationEntry[] whitelistEntries;
+        RecoveryTargetMigrationEntry[] recoveryEntries;
+        address migrationEmergencyKey;
+        SubscriptionPlan subscriptionPlan;
+        uint64 subscriptionExpiresAt;
+        address treasury;
+        bytes32 appVersionHash;
+        address p2pAdmin;
+        address p2pDAO;
+        uint64 p2pTimeout;
+        address[] approvedTradingPlatforms;
+        PlanConfigMigrationEntry[] planConfigEntries;
+    }
+
+    /// @dev v5.1.8: cross-check БЕЗУСЛОВНЫЙ для subscription, treasury,
+    ///      appVersionHash, P2P config. Требуется точное совпадение с
+    ///      raw-состоянием old guard. Предотвращает потерю state через
+    ///      подписанную, но некорректную migrationData.
+    function acceptMigration(
+        address oldGuard,
+        address expectedMainWallet,
+        bytes32 migrationDataHash,
+        bytes calldata migrationData
+    ) external override nonReentrant {
+        require(!migrationAccepted, "already accepted");
+        require(!migratedOut, "already migrated out");
+        require(expectedOldGuard != address(0), "not a migration target");
+        require(oldGuard == expectedOldGuard, "unexpected old guard");
+        require(msg.sender == expectedOldGuard, "not old guard");
+        require(expectedMainWallet == mainWallet, "wrong main wallet");
+        require(keccak256(migrationData) == migrationDataHash, "hash mismatch");
+        require(IGuardState(oldGuard).mainWallet() == mainWallet, "old main mismatch");
+        require(IGuardState(oldGuard).permit2() == permit2, "permit2 mismatch");
+        require(IGuardState(oldGuard).migratedOut(), "old guard not migrated");
+
+        MigrationData memory d = abi.decode(migrationData, (MigrationData));
+
+        // ---- Owners ----
+        require(d.newOwners.length == TOTAL_OWNERS && d.newIsHot.length == TOTAL_OWNERS, "bad owners");
+        uint256 hotCount;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            require(d.newOwners[i] != address(0), "zero owner");
+            for (uint256 j = 0; j < i; j++) require(d.newOwners[j] != d.newOwners[i], "dup");
+            if (d.newIsHot[i]) hotCount++;
+        }
+        require(hotCount == HOT_OWNERS, "need 3 hot");
+
+        address[] memory oldOwners = IGuardState(oldGuard).getOwners();
+        require(oldOwners.length == TOTAL_OWNERS, "old owners mismatch");
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            require(oldOwners[i] == d.newOwners[i], "owner mismatch");
+            require(IGuardState(oldGuard).isOwnerHot(oldOwners[i]) == d.newIsHot[i], "isHot mismatch");
+        }
+        for (uint256 i = 0; i < owners.length; i++) {
+            ownerInfo[owners[i]] = OwnerInfo(false, false);
+            emit OwnerChanged(owners[i], false, false);
+        }
+        delete owners;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            ownerInfo[d.newOwners[i]] = OwnerInfo(true, d.newIsHot[i]);
+            owners.push(d.newOwners[i]);
+            emit OwnerChanged(d.newOwners[i], d.newIsHot[i], true);
+        }
+
+        // ---- Hot wallets ----
+        for (uint256 i = 0; i < d.hotWallets.length; i++) {
+            address w = d.hotWallets[i];
+            require(w != address(0) && w.code.length > 0, "bad hot");
+            require(IGuardState(oldGuard).hotWallets(w), "hot not in old");
+            require(!coldWallets[w], "hot also cold");
+            for (uint256 j = 0; j < i; j++) require(d.hotWallets[j] != w, "dup hot");
+            hotWallets[w] = true;
+            emit HotWalletUpdated(w, true);
+        }
+
+        // ---- Cold wallets ----
+        for (uint256 i = 0; i < d.coldWallets.length; i++) {
+            address w = d.coldWallets[i];
+            require(w != address(0) && w.code.length > 0, "bad cold");
+            require(IGuardState(oldGuard).coldWallets(w), "cold not in old");
+            require(!hotWallets[w], "cold also hot");
+            for (uint256 j = 0; j < i; j++) require(d.coldWallets[j] != w, "dup cold");
+            coldWallets[w] = true;
+            emit ColdWalletUpdated(w, true);
+        }
+
+        // ---- Tokens ----
+        for (uint256 i = 0; i < d.approvedTokens.length; i++) {
+            address t = d.approvedTokens[i];
+            require(t.code.length > 0, "bad token");
+            require(IGuardState(oldGuard).approvedToken(t), "token not in old");
+            for (uint256 j = 0; j < i; j++) require(d.approvedTokens[j] != t, "dup token");
+            approvedToken[t] = true;
+            emit TokenUpdated(t, true);
+        }
+
+        // ---- Routers ----
+        for (uint256 i = 0; i < d.approvedRouters.length; i++) {
+            address r = d.approvedRouters[i];
+            require(r.code.length > 0, "bad router");
+            require(IGuardState(oldGuard).approvedRouter(r), "router not in old");
+            for (uint256 j = 0; j < i; j++) require(d.approvedRouters[j] != r, "dup router");
+            approvedRouter[r] = true;
+            emit RouterUpdated(r, true);
+        }
+
+        // ---- Blacklist ----
+        for (uint256 i = 0; i < d.blacklistAddrs.length; i++) {
+            address b = d.blacklistAddrs[i];
+            require(IGuardState(oldGuard).blacklist(b), "blacklist not in old");
+            for (uint256 j = 0; j < i; j++) require(d.blacklistAddrs[j] != b, "dup blacklist");
+            blacklist[b] = true;
+            emit BlacklistUpdated(b, true);
+        }
+
+        // ---- Whitelist ----
+        for (uint256 i = 0; i < d.whitelistEntries.length; i++) {
+            WhitelistMigrationEntry memory e = d.whitelistEntries[i];
+            (bool ex, uint256 lm, uint256 rm, uint256 dl) =
+                IGuardState(oldGuard).getWhitelistEntry(e.recipient, e.token);
+            require(ex, "wl not in old");
+            require(lm == e.limit && rm == e.remaining && dl == e.deadline, "wl mismatch");
+            if (e.token != NATIVE) require(approvedToken[e.token], "wl token not approved");
+            whitelist[e.recipient][e.token] = WhitelistEntry(true, e.limit, e.remaining, e.deadline);
+            emit WhitelistUpdated(e.recipient, e.token, e.limit, e.deadline, true);
+        }
+
+        // ---- Recovery targets ----
+        for (uint256 i = 0; i < d.recoveryEntries.length; i++) {
+            RecoveryTargetMigrationEntry memory e = d.recoveryEntries[i];
+            (bool ex, address rc) = IGuardState(oldGuard).getRecoveryTarget(e.wallet, e.token);
+            require(ex, "rc not in old");
+            require(rc == e.recipient, "rc mismatch");
+            require(_isRegisteredWallet(e.wallet), "rc wallet not registered");
+            recoveryTargets[e.wallet][e.token] = RecoveryTarget(true, e.recipient);
+            emit RecoveryTargetUpdated(e.wallet, e.token, e.recipient, true);
+        }
+
+        // ---- Migration emergency key ----
+        if (d.migrationEmergencyKey != address(0)) {
+            require(
+                d.migrationEmergencyKey == IGuardState(oldGuard).migrationEmergencyKey(),
+                "emergency key mismatch"
+            );
+            require(d.migrationEmergencyKey.code.length == 0, "emergency not EOA");
+            migrationEmergencyKey = d.migrationEmergencyKey;
+            emit MigrationEmergencyKeyChanged(address(0), d.migrationEmergencyKey);
+        }
+
+        // ---- Subscription (v5.1.8: БЕЗУСЛОВНЫЙ cross-check) ----
+        {
+            (uint8 oldPlan, uint64 oldExpiry) = IGuardState(oldGuard).getRawSubscription();
+            require(uint8(d.subscriptionPlan) == oldPlan, "sub plan mismatch");
+            require(d.subscriptionExpiresAt == oldExpiry, "sub expiry mismatch");
+            if (d.subscriptionExpiresAt > 0) {
+                subscriptions[mainWallet] = Subscription(d.subscriptionPlan, d.subscriptionExpiresAt);
+                emit Subscribed(mainWallet, d.subscriptionPlan, address(0), 0, d.subscriptionExpiresAt);
+            }
+        }
+
+        // ---- Treasury (v5.1.8: БЕЗУСЛОВНЫЙ cross-check) ----
+        {
+            address oldTreasury = IGuardState(oldGuard).treasury();
+            require(d.treasury == oldTreasury, "treasury mismatch");
+            if (d.treasury != address(0)) {
+                treasury = d.treasury;
+                emit TreasuryUpdated(address(0), d.treasury);
+            }
+        }
+
+        // ---- App version (v5.1.8: БЕЗУСЛОВНЫЙ cross-check) ----
+        {
+            bytes32 oldHash = IGuardState(oldGuard).appVersionHash();
+            require(d.appVersionHash == oldHash, "app version mismatch");
+            if (d.appVersionHash != bytes32(0)) {
+                appVersionHash = d.appVersionHash;
+                emit AppVersionUpdated(bytes32(0), d.appVersionHash);
+            }
+        }
+
+        // ---- P2P config (v5.1.8: БЕЗУСЛОВНЫЙ cross-check) ----
+        {
+            address oldAdmin = IGuardState(oldGuard).p2pAdmin();
+            address oldDAO = IGuardState(oldGuard).p2pDAO();
+            uint64 oldTimeout = IGuardState(oldGuard).p2pTimeout();
+            require(d.p2pAdmin == oldAdmin, "p2pAdmin mismatch");
+            require(d.p2pDAO == oldDAO, "p2pDAO mismatch");
+            require(d.p2pTimeout == oldTimeout, "p2pTimeout mismatch");
+            if (d.p2pAdmin != address(0) || d.p2pDAO != address(0) || d.p2pTimeout != 0) {
+                p2pAdmin = d.p2pAdmin;
+                p2pDAO = d.p2pDAO;
+                p2pTimeout = d.p2pTimeout;
+                emit P2PConfigUpdated(d.p2pAdmin, d.p2pDAO, d.p2pTimeout);
+            }
+        }
+
+        // ---- Trading platforms ----
+        for (uint256 i = 0; i < d.approvedTradingPlatforms.length; i++) {
+            address p = d.approvedTradingPlatforms[i];
+            require(p != address(0) && p.code.length > 0, "bad platform");
+            require(IGuardState(oldGuard).approvedTradingPlatform(p), "platform not in old");
+            for (uint256 j = 0; j < i; j++) require(d.approvedTradingPlatforms[j] != p, "dup platform");
+            approvedTradingPlatform[p] = true;
+            emit TradingPlatformUpdated(p, true);
+        }
+
+        // ---- Plan configs ----
+        for (uint256 i = 0; i < d.planConfigEntries.length; i++) {
+            PlanConfigMigrationEntry memory e = d.planConfigEntries[i];
+            require(e.plan == uint8(SubscriptionPlan.STANDARD) || e.plan == uint8(SubscriptionPlan.PREMIUM), "bad plan");
+            (address pt, uint256 pr, uint64 pd, bool en) = IGuardState(oldGuard).getPlanConfig(e.plan);
+            require(
+                pt == e.paymentToken && pr == e.price && pd == e.period && en == e.enabled,
+                "plan config mismatch"
+            );
+            SubscriptionPlan sp = SubscriptionPlan(e.plan);
+            planConfigs[sp] = PlanConfig(e.paymentToken, e.price, e.period, e.enabled);
+            emit PlanConfigUpdated(sp, e.paymentToken, e.price, e.period, e.enabled);
+        }
+
+        migrationAccepted = true;
+        emit MigrationAccepted(oldGuard);
+    }
+
+    // =========================================================================
+    // View
+    // =========================================================================
+
+    function getWhitelistEntry(address recipient, address token)
+        external view returns (bool exists, uint256 limit, uint256 remaining, uint256 deadline)
+    {
+        WhitelistEntry storage w = whitelist[recipient][token];
+        return (w.exists, w.limit, w.remaining, w.deadline);
+    }
+
+    function getAdapterPolicy(address adapter, address token)
+        external view returns (bool exists, uint256 limit, uint256 remaining, uint256 deadline)
+    {
+        AdapterPolicy storage p = adapterPolicy[adapter][token];
+        return (p.exists, p.limit, p.remaining, p.deadline);
+    }
+
+    function getRecoveryTarget(address w, address token)
+        external view returns (bool exists, address recipient)
+    {
+        RecoveryTarget storage rt = recoveryTargets[w][token];
+        return (rt.exists, rt.recipient);
+    }
+
+    function getOwners() external view returns (address[] memory) { return owners; }
+    function isOwnerHot(address o) external view returns (bool) { return ownerInfo[o].isHot; }
+    function isNonceUsed(address w, uint256 n) external view returns (bool) { return usedNonces[w][n]; }
+    function getPendingMigration() external view returns (Migration memory) { return pendingMigration; }
+    function getMigrationCancelCount(address newGuard) external view returns (uint256) {
+        return migrationCancelCount[mainWallet][newGuard];
+    }
+    function isRegisteredWallet(address w) external view returns (bool) { return _isRegisteredWallet(w); }
+}
+```
+
+## Итог v5.1.8
+
+### MUST-FIX из review
+
+| # | Проблема | Решение |
+|---|---|---|
+| 1 | Потеря subscription/treasury/appHash/P2P при `d.X == 0` | Cross-check сделан **безусловным**: `require(d.X == raw)` даже если `d.X == 0`. Запись в storage — только при `d.X != 0` |
+| 2 | `proposeWalletGuardMigration` только до finalize | Добавлено `address public migratedTo`. Функция работает в обоих случаях: до finalize — `pendingMigration.newGuard`, после — `migratedTo`. Убран `notMigrated` |
+| 3 | Whitelist в `executeSwap` (TZ §23) | Оставлено + подробная документация: сознательное расширение ТЗ; клиент обязан ставить `minAmountOut` с учётом overshoot |
+| 4 | `emergencySweep` без `_checkWalletGuard` | Добавлено `_checkWalletGuard(w)` для консистентности |
+
+### Что осталось задокументировано (обновление ТЗ)
+
+- **§63** — emergency migration сохраняет 48h delay (сознательно).
+- **§64** — adapter policies не мигрируют (immutable guard).
+- **§82** — events семантически эквивалентны, имена иные.
+- **§100** — permission bits зарезервированы для будущих user-facing модулей.
+- **§113** — `getWhitelist()` невозможен (mapping); индексация через события.
+- **§114** — VERSION = 5.1.8.
+- **§7** — nonce scope emergencySweep = wallet, subscribe = fromWallet.
+
+### Дальнейшие шаги
+
+1. Foundry unit / fuzz / invariant tests (§117–119).
+2. Migration flow v5.1.7 → v5.1.8 с полным acceptance.
+3. Тест сценария: subscription active на old guard → migration → активна на new.
+4. Тест сценария: wallet proposal после finalize (с `migratedTo`).
+5. Независимый security review.
