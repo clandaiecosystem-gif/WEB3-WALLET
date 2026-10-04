@@ -1,0 +1,225 @@
+# SmartWalletGuard v6.1.0 — что сделано по новому ТЗ
+
+Обновление поверх рабочей разбивки v6.0.0. Монолит не возвращался: Guard,
+OwnerRegistry, PolicyRegistry, SubscriptionManager остались отдельными, плюс
+добавлены MigrationHub и MigrationModule.
+
+## 1. Итог компиляции (solc 0.8.30, optimizer 200, viaIR, 0 errors)
+
+```text
+contract                              runtime       init   лимит 24576/49152
+SmartWalletGuard                        23459      24420   ok
+SmartWalletPolicyRegistry               21861      22229   ok
+SmartWalletGuardSubscriptions           22500      23663   ok
+SmartWalletGuardMigrationModule         13791      14421   ok
+SmartWalletMigrationHub                  7086       7625   ok
+SmartWalletGuardOwnerRegistry            5760       5928   ok
+GuardOps (library)                         57         85
+```
+
+## 2. Adapter architecture удалена
+
+Удалено полностью, а не «доработано»:
+
+| Удалено | Где было |
+|---|---|
+| `ISwapAdapterView` | GuardInterfaces, Guard |
+| `AdapterPolicy`, `adapterPolicy`, `getAdapterPolicy` | PolicyRegistry |
+| `addAdapter`, `removeAdapter`, `increaseAdapterLimit`, `changeAdapterDeadline` | PolicyRegistry, Subscriptions |
+| `spendAdapter`, `consumeWhitelist` | PolicyRegistry |
+| `executeSwap` | Guard |
+| проверки `adapter.guard()`, `adapter.code.length` | Guard |
+| передача токенов сначала адаптеру | Guard |
+| `AdapterBlacklisted/WrongGuard/NotRegistered/LimitExceeded/DeadlineExpired` | Guard, PolicyRegistry |
+| `adapterEntries` в миграции | MigrationHub |
+
+Вместо этого один универсальный путь: Guard знает только
+`targetContract + token + amount` и не знает, что этот контракт делает.
+Никаких `UniswapAdapter` / `CurveAdapter` / `AaveAdapter` больше нет.
+
+## 3. Whitelist заменён на contract-level policy
+
+`whitelist[recipient][token]` больше не существует.
+
+```solidity
+struct ContractPolicy {
+    bool exists;
+    bool blocked;            // §19: полная блокировка контракта
+    uint256 usdLimit;        // микро-USD (1e6 = $1); 0 => автотрата запрещена (§15)
+    uint256 usdSpent;        // §16, §17
+    uint256 maxTokenShareBps;// 2000 = 20 % (§6, §10)
+    uint256 deadline;        // §20
+}
+mapping(address => ContractPolicy) public contractPolicy;   // ключ = smart contract
+```
+
+Одна запись на **контракт**, а не на «контракт + токен». `recipient` и `spender`
+больше не смешиваются: `executeOnContract` расходует в пользу `targetContract`,
+`transfer`/`transferNative` переводят на адрес получателя.
+
+## 4. Категория риска токена (§5-§9)
+
+```solidity
+enum TokenRiskCategory { GREEN, YELLOW, RED }
+mapping(address => TokenRisk) private _tokenRisk;   // configured + category
+function effectiveTokenRisk(address) returns (TokenRiskCategory); // UNKNOWN => RED
+```
+
+* **GREEN** — есть заранее настроенная цена: USD-лимит **+** доля баланса.
+* **YELLOW** — `TokenAmountPolicy` (абсолютное количество) **+** доля баланса.
+* **RED** — то же, что YELLOW.
+* **UNKNOWN** — по умолчанию RED (`effectiveTokenRisk` возвращает RED, если
+  токен не сконфигурирован). Нельзя получить «неизвестный токен + поддельная
+  цена + $1000 лимит = весь supply»: без записи в registry USD-режим не
+  включается, а без `TokenAmountPolicy` операция отклоняется вовсе.
+
+## 5. Защита от исчерпания supply (§10, §11)
+
+Доля баланса считается on-chain по `IERC20(token).balanceOf(wallet)` и
+применяется **всегда** — и для GREEN, и для YELLOW, и для RED, и для обычных
+переводов на адрес получателя (`defaultTransferShareBps`). Баланс берётся
+**до** операции, поэтому дробление вывода на много транзакций не помогает.
+Backend не передаёт баланс как trusted input — он в подписи вообще не участвует.
+
+## 6. Approve (§12, §13, §14)
+
+`guard.approveOnContract(...)`:
+
+* `type(uint256).max` → `UnlimitedApprove` (§13);
+* approve на конкретную сумму проходит через ту же `checkAndSpend`, поэтому
+  увеличивает `usdSpent`;
+* множество approve не обходит лимит: второй approve на ту же сумму упирается
+  в исчерпанный `usdLimit` (тест `MultipleApprovalsCannotBypassPolicy`).
+
+## 7. Limit = 0 и strict-режим (§15, §52)
+
+`usdLimit == 0` означает «автотрата запрещена»: операция требует
+дополнительной подписи локального security-ключа. Ключ задаётся через
+`strictKey` / `pendingStrictKey` (propose → accept, как rotation в ТЗ v5.1.4
+§36), разблокируется на устройстве паролем; on-chain хранится только адрес.
+Флаг `strict` входит в EIP-712 digest, поэтому обычную подпись нельзя
+переиспользовать как strict-операцию.
+
+## 8. Migration: MigrationHub — единственный источник истины (§28-§34)
+
+Guard больше **не хранит** `migratedOut`, `migrationAccepted`, `migratedTo` и
+не имеет `markMigratedOut` / `acceptMigrationIn`. Guard читает состояние у Hub:
+
+```solidity
+modifier notMigrated() {
+    if (msg.sender != hub) {
+        if (IMigrationHubView(migrationHub).finalizedOut(address(this))) revert MigratedOutError();
+        if (expectedOldGuard != address(0)
+            && !IMigrationHubView(migrationHub).acceptedFrom(address(this), expectedOldGuard))
+            revert MigrationNotAccepted();
+    }
+    _;
+}
+```
+
+Hub ведёт `MigrationState { NONE, PROPOSED, READY, FINALIZED, CANCELLED }`,
+`Migration { oldGuard, newGuard, migrationDataHash, proposedAt, executableAt,
+state, emergency }`, `currentMigrationId`, `acceptedFrom`, `finalizedOut`,
+`migrationCancelCount`. Старый Guard не «передаёт state» новому — Hub знает
+обоих.
+
+Сохранено: 48 h, `MAX_MIGRATION_CANCELS = 3`, emergency-путь только после трёх
+отмен и с подписью `migrationEmergencyKey` + 3/5 + Cold. Исправлен дефект
+v5.2.1/v6.0.0: `executeAfter` входит в digest как подписанное значение, а не как
+`block.timestamp` после подписи.
+
+Применение снапшота выполняет `SmartWalletGuardMigrationModule`: Hub только
+ведёт состояние и таймлок, модуль проверяет `authorizedMigration(newGuard)`,
+ `acceptedFrom(newGuard, oldGuard)` и сверяет каждый элемент снапшота со старым
+Guard-ом/Registry.
+
+## 9. Что сохранено без изменений (как просили)
+
+* **OwnerRegistry / EIP-712** — thresholds 2/3 Hot и 3/5 + Cold не менялись.
+* **Permit2 expiration** — `expiration != 0 && expiration >= block.timestamp`.
+* **Emergency Sweep** — 2/3 Hot, без Cold, без подписки, без whitelist/policy,
+  получатель только из `recoveryTargets` (тесты 30-33).
+* **Подписка** — on-chain, FREE / STANDARD / PREMIUM, истёкшая подписка
+  отключает платные функции, но не emergency (тесты 34-38).
+
+## 10. Тесты (§56)
+
+`test/GuardPolicy.t.sol` — 21 тест (1-21), `test/GuardMigration.t.sol` — 17
+тестов (22-38). Итого **38 тестовых функций**, все из списка ТЗ.
+
+```text
+test/TestBase.sol        — минимальная база (без внешней forge-std)
+test/Mocks.sol           — MockERC20, MockPermit2, MockWallet
+test/GuardFixture.sol    — стенд: 5 owners, реальные ECDSA-подписи через vm.sign
+test/GuardPolicy.t.sol   — whitelist / GREEN / YELLOW / RED / supply / approve
+test/GuardMigration.t.sol— migration + emergency + subscription
+foundry.toml             — solc 0.8.30, viaIR, optimizer 200
+```
+
+### Ограничение окружения (важно)
+
+`forge` из этой среды **не запускается**: его сборка падает с
+`Access denied (os error 5)` при попытке запустить дочерний `solc` — это
+ограничение песочницы на piped stdio дочерних процессов, и оно сохраняется
+даже с полным доступом (проверено `--offline` и `danger-full-access`).
+Поэтому тесты проверены компилятором (`solc 0.8.30`, 0 errors, 38 функций
+обнаружены), но **не выполнены**.
+
+Запуск в обычном окружении:
+
+```bash
+forge test -vv
+```
+
+`tools/compile_tests.js` дополнительно проверяет, что тесты компилируются, и
+печатает число найденных `test_*` функций.
+
+## 11. Что осталось честно не закрытым
+
+1. **Тесты не выполнены** — только скомпилированы (см. выше).
+
+### 11.1 Найдено и исправлено после первого прохода
+
+При подготовке выгрузки я проверил итоговые файлы перебором и нашёл **недодел**:
+в `SmartWalletGuardSubscriptions` оставались adapter-функции
+(`addAdapter`, `removeAdapter`, `increaseAdapterLimit`, `changeAdapterDeadline`),
+которые компиляция не поймала, потому что они обращались к *локальному*
+интерфейсу `ISubPolicyRegistry`, а не к `IPolicyRegistryView`. В рантайме они
+всегда падали бы, но это был именно тот тип мёртвого кода, который вы просили
+удалить, а не «доработать».
+
+Исправлено: adapter-функции и `ISubSwapAdapter` удалены; вместо них в
+SubscriptionManager добавлены пользовательские операции новой модели —
+`addContractPolicy`, `blockContract`, `increaseContractUsdLimit`,
+`removeContractPolicy`, `addTokenRisk`, `addTokenPrice`,
+`addTokenAmountPolicy`, `setDefaultTransferShare`; в PolicyRegistry добавлена
+`claimContractPolicy` для миграции; старые whitelist-функции
+(`addWhitelist`/`removeWhitelist`/`increaseWhitelistLimit`/
+`changeWhitelistDeadline`) удалены вместе с моделью.
+
+Остаточные упоминания «adapter» в коде — только в `GuardOps`
+(`Swap`-typehash, оставлен для совместимости подписей) и в комментариях,
+описывающих, что именно удалено.
+
+Размеры после правки:
+
+```text
+SmartWalletGuard                        23459 / 24576   ok
+SmartWalletPolicyRegistry               21861 / 24576   ok
+SmartWalletGuardSubscriptions           22500 / 24576   ok
+SmartWalletGuardMigrationModule         13791 / 24576   ok
+SmartWalletMigrationHub                  7086 / 24576   ok
+SmartWalletGuardOwnerRegistry            5760 / 24576   ok
+```
+2. **`approve` вне Guard.** `approveOnContract` защищает от unlimited и считает
+   расход, но чтобы это было непреодолимо, Smart Wallet не должен давать
+   владельцу/бэкенду прямой путь к `token.approve(...)`. Это требование к
+   реализации кошелька (его исходника в поставке нет).
+3. **Цена GREEN-токена** задаётся владельцами через `setTokenPrice` и хранится
+   on-chain; внешнего оракула или backend-цены в пути исполнения нет (§25-§27).
+   Насколько «правильна» эта цена — вопрос governance-процесса вне контракта.
+4. **Кошелёк и адаптер** (теперь просто «любой внешний контракт») в поставке
+   отсутствуют; проверены только интерфейсные вызовы.
+5. **Запас размера.** Guard — 23 459 байт при лимите 24 576 (запас 1 117),
+   Subscriptions — 22 518 (запас 2 058). Дальнейшее расширение требует
+   выноса кода, а не добавления.

@@ -1,0 +1,31 @@
+const https = require('https');
+const fs = require('fs');
+
+const url = process.argv[2];
+const out = process.argv[3];
+
+function get(u, redirects) {
+  if (redirects > 6) throw new Error('too many redirects');
+  https.get(u, { headers: { 'user-agent': 'node' } }, (res) => {
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      res.resume();
+      return get(res.headers.location, redirects + 1);
+    }
+    if (res.statusCode !== 200) {
+      fs.writeFileSync(out + '.err', 'HTTP ' + res.statusCode);
+      process.exit(2);
+    }
+    const chunks = [];
+    res.on('data', (d) => chunks.push(d));
+    res.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      fs.writeFileSync(out, buf);
+      console.log('wrote', buf.length, 'bytes');
+    });
+  }).on('error', (e) => {
+    fs.writeFileSync(out + '.err', String(e && e.message));
+    process.exit(3);
+  });
+}
+
+get(url, 0);

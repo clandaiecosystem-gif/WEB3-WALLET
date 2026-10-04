@@ -1,0 +1,404 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { GuardFixture } from "./GuardFixture.sol";
+import { SmartWalletGuard } from "../contracts/SmartWalletGuard-v6.1.0.sol";
+import { SmartWalletGuardOwnerRegistry } from "../contracts/SmartWalletGuardOwnerRegistry-v6.0.0.sol";
+import { SmartWalletPolicyRegistry } from "../contracts/SmartWalletPolicyRegistry-v6.1.0.sol";
+import { SmartWalletGuardSubscriptions } from "../contracts/SmartWalletGuardSubscriptions-v6.0.0.sol";
+import { SmartWalletMigrationHub } from "../contracts/SmartWalletMigrationHub-v6.1.0.sol";
+import { SmartWalletGuardMigrationModule } from "../contracts/SmartWalletGuardMigrationModule-v6.1.0.sol";
+import { MockERC20, MockWallet } from "./Mocks.sol";
+
+contract GuardMigrationTest is GuardFixture {
+
+    uint256 internal constant MIGRATION_DELAY = 48 hours;
+
+    uint256 internal newHot1Pk = 0x7777;
+    uint256 internal newHot2Pk = 0x8888;
+    uint256 internal newHot3Pk = 0x9999;
+    uint256 internal newCold1Pk = 0xAAAA;
+    uint256 internal newCold2Pk = 0xBBBB;
+
+    SmartWalletGuard internal newGuard;
+    SmartWalletGuardOwnerRegistry internal newOwnerRegistry;
+    SmartWalletPolicyRegistry internal newPolicy;
+    SmartWalletGuardSubscriptions internal newSubs;
+    SmartWalletMigrationHub internal newHub;
+    SmartWalletGuardMigrationModule internal newModule;
+    MockWallet internal newWallet;
+
+    function _deployNewGuardSet() internal {
+        address[] memory newOwners = new address[](5);
+        newOwners[0] = hot1;
+        newOwners[1] = hot2;
+        newOwners[2] = hot3;
+        newOwners[3] = cold1;
+        newOwners[4] = cold2;
+        bool[] memory isHot = new bool[](5);
+        isHot[0] = true;
+        isHot[1] = true;
+        isHot[2] = true;
+
+        newOwnerRegistry = new SmartWalletGuardOwnerRegistry(address(permit2));
+        newGuard = new SmartWalletGuard(
+            mainWallet, address(newOwnerRegistry), address(permit2), address(guard)
+        );
+        newOwnerRegistry.setGuard(address(newGuard));
+
+        newPolicy = new SmartWalletPolicyRegistry(address(newGuard));
+        newSubs = new SmartWalletGuardSubscriptions(
+            mainWallet, address(permit2), address(newPolicy), address(newOwnerRegistry)
+        );
+        newHub = new SmartWalletMigrationHub(mainWallet, address(permit2));
+        newModule = new SmartWalletGuardMigrationModule(
+            address(newGuard), address(newHub), address(newOwnerRegistry), address(newPolicy), address(newSubs)
+        );
+
+        // ВАЖНО: configureModules разрешает указывать любой hub, который сам
+        // ссылается на этот Guard (isBoundTo), поэтому фронтраннинг невозможен.
+        newGuard.configureModules(address(newPolicy), address(newSubs), address(newHub), address(newModule));
+        newHub.bindGuard(address(newGuard));
+    }
+
+    function _migrationDigest(
+        address oldG, address newG, bytes32 dataHash, uint256 nonce, uint256 executeAfter, uint256 deadline, bool emergency
+    ) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", hub.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("Migration(address mainWallet,address newGuard,bytes32 migrationDataHash,uint256 nonce,uint256 executeAfter,uint256 deadline,bool emergency)"),
+                mainWallet, newG, dataHash, nonce, executeAfter, deadline, emergency
+            ))
+        ));
+    }
+
+    function _cancelDigest(address newG, uint256 nonce, uint256 deadline) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", hub.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("CancelMigration(address mainWallet,address newGuard,uint256 nonce,uint256 deadline)"),
+                mainWallet, newG, nonce, deadline
+            ))
+        ));
+    }
+
+    /// @dev Снапшот: owners + пустые списки + текущий конфиг.
+    function _snapshot() internal view returns (bytes memory) {
+        address[] memory ownersArr = new address[](5);
+        ownersArr[0] = hot1;
+        ownersArr[1] = hot2;
+        ownersArr[2] = hot3;
+        ownersArr[3] = cold1;
+        ownersArr[4] = cold2;
+        bool[] memory isHot = new bool[](5);
+        isHot[0] = true;
+        isHot[1] = true;
+        isHot[2] = true;
+
+        return abi.encode(
+            ownersArr, isHot,
+            new address[](0), new address[](0),        // hot/cold wallets
+            new address[](0), new address[](0),        // tokens/routers
+            new address[](0), new address[](0),        // blacklist/platforms
+            new address[](0), new uint256[](0), new uint256[](0), new uint256[](0), new bool[](0), // contract policies
+            new address[](0), new uint8[](0),          // risk
+            new address[](0), new uint256[](0), new uint8[](0), // price
+            new address[](0), new address[](0), new uint256[](0), new uint256[](0), // amount
+            new address[](0), new address[](0), new address[](0), // recovery
+            uint8(0), uint64(0),                       // subscription
+            address(0),                                // treasury
+            bytes32(0),                                // appVersionHash
+            address(0), address(0), uint64(0),         // p2p
+            uint256(0),                                // defaultTransferShareBps
+            address(0),                                // migrationEmergencyKey
+            address(0)                                 // strictKey
+        );
+    }
+
+    // =========================================================================
+    // 22-25: базовый поток миграции
+    // =========================================================================
+
+    function test_22_MigrationHubIsSourceOfTruth() public {
+        // Guard не хранит migratedOut/migrationAccepted/migratedTo
+        assertEq(hub.migrationStateOf(address(guard)), uint256(SmartWalletMigrationHub.MigrationState.NONE));
+        assertFalse(hub.finalizedOut(address(guard)));
+
+        _deployNewGuardSet();
+        bytes memory data = _snapshot();
+        bytes32 dataHash = keccak256(data);
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), dataHash, 20, executeAfter, type(uint256).max, false);
+
+        hub.proposeMigration(address(guard), address(newGuard), dataHash, 20, type(uint256).max, _threeCritical(dgst));
+
+        assertEq(hub.migrationStateOf(address(guard)), uint256(SmartWalletMigrationHub.MigrationState.PROPOSED));
+        // До таймлока финализация невозможна
+        vm.expectRevert(SmartWalletMigrationHub.TimelockActive.selector);
+        hub.finalizeMigration(1, data);
+    }
+
+    function test_23_OldGuardCannotPretendMigrationState() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+
+        _deployNewGuardSet();
+        bytes memory data = _snapshot();
+        bytes32 dataHash = keccak256(data);
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), dataHash, 20, executeAfter, type(uint256).max, false);
+        hub.proposeMigration(address(guard), address(newGuard), dataHash, 20, type(uint256).max, _threeCritical(dgst));
+
+        // Владельцы не могут «подделать» migratedOut — такого метода нет вовсе.
+        // Единственный путь — финализация через Hub, которая требует таймлок.
+        assertFalse(hub.finalizedOut(address(guard)));
+
+        vm.warp(executeAfter + 1);
+        hub.finalizeMigration(1, data);
+        assertTrue(hub.finalizedOut(address(guard)));
+    }
+
+    function test_24_NewGuardBecomesOperational() public {
+        _deployNewGuardSet();
+        bytes memory data = _snapshot();
+        bytes32 dataHash = keccak256(data);
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), dataHash, 20, executeAfter, type(uint256).max, false);
+        hub.proposeMigration(address(guard), address(newGuard), dataHash, 20, type(uint256).max, _threeCritical(dgst));
+        vm.warp(executeAfter + 1);
+        hub.finalizeMigration(1, data);
+
+        // Новый Guard полностью работоспособен (не «заморожен»)
+        assertTrue(newGuard.initialized());
+        assertEq(newOwnerRegistry.getOwners().length, 5);
+        (uint8 plan, ) = newSubs.getSubscription();
+        assertEq(uint256(plan), 0);
+        // и он принял миграцию от старого Guard-а
+        assertEq(hub.acceptedFrom(address(newGuard)), address(guard));
+    }
+
+    function test_25_WalletMigratesToNewGuard() public {
+        _deployNewGuardSet();
+        bytes memory data = _snapshot();
+        bytes32 dataHash = keccak256(data);
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), dataHash, 20, executeAfter, type(uint256).max, false);
+        hub.proposeMigration(address(guard), address(newGuard), dataHash, 20, type(uint256).max, _threeCritical(dgst));
+
+        vm.warp(executeAfter + 1);
+        hub.finalizeMigration(1, data);
+
+        // После финализации migration module предлагает кошельку новый Guard
+        newModule.proposeWalletGuardMigration(address(newGuard), address(wallet));
+        assertEq(wallet.pendingGuard(), address(newGuard));
+
+        vm.warp(block.timestamp + 48 hours + 1);
+        newGuard.acceptWalletGuardMigration(address(wallet));
+        assertEq(wallet.guard(), address(newGuard));
+    }
+
+    // =========================================================================
+    // 26-27: миграция не переносит балансы и не требует адаптеров
+    // =========================================================================
+
+    function test_26_MigrationDoesNotTransferWalletBalances() public {
+        _fund(address(usd), 1_000 * 1e6);
+        _deployNewGuardSet();
+        bytes memory data = _snapshot();
+        bytes32 dataHash = keccak256(data);
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), dataHash, 20, executeAfter, type(uint256).max, false);
+        hub.proposeMigration(address(guard), address(newGuard), dataHash, 20, type(uint256).max, _threeCritical(dgst));
+        vm.warp(executeAfter + 1);
+        hub.finalizeMigration(1, data);
+
+        assertEq(_balanceOf(address(usd), address(wallet)), 1_000 * 1e6);
+    }
+
+    function test_27_MigrationDoesNotRequireAdapters() public {
+        // В v6.1 нет adapter-полей: снапшот состоит только из актуальных policy.
+        _deployNewGuardSet();
+        bytes memory data = _snapshot();
+        bytes32 dataHash = keccak256(data);
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), dataHash, 20, executeAfter, type(uint256).max, false);
+        hub.proposeMigration(address(guard), address(newGuard), dataHash, 20, type(uint256).max, _threeCritical(dgst));
+        vm.warp(executeAfter + 1);
+        hub.finalizeMigration(1, data);
+        assertTrue(newGuard.initialized());
+    }
+
+    // =========================================================================
+    // 28-29: лимит отмен и emergency-ключ
+    // =========================================================================
+
+    function test_28_CancelLimitBlocksNormalMigration() public {
+        _deployNewGuardSet();
+
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+            bytes32 dgst = _migrationDigest(address(guard), address(newGuard), bytes32(uint256(1)), 100 + i, executeAfter, type(uint256).max, false);
+            uint256 id2 = hub.proposeMigration(address(guard), address(newGuard), bytes32(uint256(1)), 100 + i, type(uint256).max, _threeCritical(dgst));
+            bytes32 cd = _cancelDigest(address(newGuard), 200 + i, type(uint256).max);
+            hub.cancelMigration(id2, 200 + i, type(uint256).max, _threeCritical(cd));
+        }
+        assertEq(hub.migrationCancelCount(mainWallet, address(newGuard)), 3);
+
+        // Четвёртая обычная миграция запрещена
+        uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _migrationDigest(address(guard), address(newGuard), bytes32(uint256(1)), 999, executeAfter, type(uint256).max, false);
+        vm.expectRevert(SmartWalletMigrationHub.MaxCancelsReached.selector);
+        hub.proposeMigration(address(guard), address(newGuard), bytes32(uint256(1)), 999, type(uint256).max, _threeCritical(dgst));
+    }
+
+    function test_29_EmergencyMigrationRequiresEmergencyKey() public {
+        _deployNewGuardSet();
+
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 executeAfter = block.timestamp + MIGRATION_DELAY;
+            bytes32 dgst = _migrationDigest(address(guard), address(newGuard), bytes32(uint256(1)), 100 + i, executeAfter, type(uint256).max, false);
+            uint256 id2 = hub.proposeMigration(address(guard), address(newGuard), bytes32(uint256(1)), 100 + i, type(uint256).max, _threeCritical(dgst));
+            bytes32 cd = _cancelDigest(address(newGuard), 200 + i, type(uint256).max);
+            hub.cancelMigration(id2, 200 + i, type(uint256).max, _threeCritical(cd));
+        }
+
+        // Без назначенного emergency key emergency-путь недоступен
+        bytes32 dgst = _migrationDigest(
+            address(guard), address(newGuard), bytes32(uint256(1)), 500, block.timestamp, type(uint256).max, true
+        );
+        vm.expectRevert(SmartWalletMigrationHub.EmergencyKeyNotSet.selector);
+        hub.proposeMigrationWithEmergency(
+            address(guard), address(newGuard), bytes32(uint256(1)), 500, type(uint256).max, _sign(HOT3_PK, dgst), _threeCritical(dgst)
+        );
+    }
+}
+
+/* =========================================================================
+   Emergency sweep и подписка (30-38)
+   ========================================================================= */
+
+contract GuardEmergencySubscriptionTest is GuardFixture {
+
+    function _setupRecovery(address token, address recipient) internal {
+        vm.prank(address(guard));
+        policy.setRecoveryTarget(address(wallet), token, recipient);
+    }
+
+    function _sweepDigestLocal(address w, address token, address recipient, uint256 nonce, uint256 deadline)
+        internal view returns (bytes32)
+    {
+        return _sweepDigest(w, token, recipient, nonce, deadline);
+    }
+
+    // 30: emergency sweep работает без подписки (FREE)
+    function test_30_EmergencySweepWorksWithoutSubscription() public {
+        _grantFree();
+        _fund(address(usd), 500 * 1e6);
+        _setupRecovery(address(usd), cold1);
+        wallet.setPaused(true);
+
+        bytes32 dgst = _sweepDigestLocal(address(wallet), address(usd), cold1, 30, type(uint256).max);
+        guard.emergencySweep(address(wallet), address(usd), 30, type(uint256).max, _twoHot(dgst));
+        assertEq(_balanceOf(address(usd), cold1), 500 * 1e6);
+    }
+
+    // 31: emergency sweep работает без whitelist/policy
+    function test_31_EmergencySweepWorksWithoutWhitelist() public {
+        _grantStandard();
+        _fund(address(meme), 123 ether);
+        _setupRecovery(address(meme), cold2);
+        wallet.setPaused(true);
+        // policy на dex вообще не настроена, whitelist отсутствует
+        bytes32 dgst = _sweepDigestLocal(address(wallet), address(meme), cold2, 31, type(uint256).max);
+        guard.emergencySweep(address(wallet), address(meme), 31, type(uint256).max, _twoHot(dgst));
+        assertEq(_balanceOf(address(meme), cold2), 123 ether);
+    }
+
+    // 32: требуется 2/3 Hot, одной подписи мало
+    function test_32_EmergencySweepRequires2HotOf3() public {
+        _grantFree();
+        _fund(address(usd), 500 * 1e6);
+        _setupRecovery(address(usd), cold1);
+        wallet.setPaused(true);
+
+        bytes32 dgst = _sweepDigestLocal(address(wallet), address(usd), cold1, 32, type(uint256).max);
+        // 1 подпись
+        vm.expectRevert(SmartWalletGuardOwnerRegistry.ThresholdNotMet.selector);
+        guard.emergencySweep(address(wallet), address(usd), 32, type(uint256).max, _oneHot(dgst));
+
+        // 2 подписи проходят
+        guard.emergencySweep(address(wallet), address(usd), 32, type(uint256).max, _twoHot(dgst));
+    }
+
+    // 33: получатель берётся только из recovery target
+    function test_33_EmergencySweepCannotUseUnauthorizedRecipient() public {
+        _grantFree();
+        _fund(address(usd), 500 * 1e6);
+        _setupRecovery(address(usd), cold1);
+        wallet.setPaused(true);
+
+        // Подпись на ДРУГОГО получателя не совпадёт с сохранённым target
+        bytes32 dgst = _sweepDigestLocal(address(wallet), address(usd), cold2, 33, type(uint256).max);
+        vm.expectRevert(SmartWalletGuardOwnerRegistry.NotAnOwner.selector);
+        guard.emergencySweep(address(wallet), address(usd), 33, type(uint256).max, _twoHot(dgst));
+    }
+
+    // 34-36: планы подписки
+    function test_34_FreePlanPermissions() public {
+        _grantFree();
+        assertEq(uint256(subs.activePlan()), 0);
+        assertTrue(guard.hasPermission(guard.PERM_APP_VERIFY()));
+        assertTrue(guard.hasPermission(guard.PERM_EMERGENCY()));
+        assertFalse(guard.hasPermission(guard.PERM_TRADING()));
+    }
+
+    function test_35_StandardPlanPermissions() public {
+        _grantStandard();
+        assertEq(uint256(subs.activePlan()), 1);
+        assertTrue(guard.hasPermission(guard.PERM_TRADING()));
+        assertTrue(guard.hasPermission(guard.PERM_COLD_WARM()));
+        assertTrue(guard.hasPermission(guard.PERM_SECURITY()));
+    }
+
+    function test_36_PremiumPlanPermissions() public {
+        vm.prank(address(guard));
+        subs.claimSubscription(2, uint64(block.timestamp + 30 days));
+        assertEq(uint256(subs.activePlan()), 2);
+        // PREMIUM = STANDARD on-chain
+        assertTrue(guard.hasPermission(guard.PERM_TRADING()));
+        assertFalse(guard.hasPermission(1 << 7));
+    }
+
+    // 37-38: истёкшая подписка
+    function test_37_ExpiredSubscriptionDisablesPaidFeatures() public {
+        _grantStandard();
+        vm.warp(block.timestamp + 366 days);
+        assertEq(uint256(subs.activePlan()), 0);
+        assertFalse(guard.hasPermission(guard.PERM_TRADING()));
+
+        _fund(address(usd), 100 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+        bytes32 d = _onContractDigest(
+            address(wallet), address(dex), address(usd), 1e6, address(wallet), false, 37, type(uint256).max
+        );
+        vm.expectRevert(SmartWalletGuard.PermissionRequired.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 1e6, address(wallet), false, 37, type(uint256).max, "", _twoHot(d)
+        );
+    }
+
+    function test_38_ExpiredSubscriptionDoesNotDisableEmergencySweep() public {
+        _grantStandard();
+        _fund(address(usd), 42 * 1e6);
+        _setupRecovery(address(usd), cold1);
+        wallet.setPaused(true);
+        vm.warp(block.timestamp + 400 days);
+        assertEq(uint256(subs.activePlan()), 0);
+
+        bytes32 dgst = _sweepDigestLocal(address(wallet), address(usd), cold1, 38, type(uint256).max);
+        guard.emergencySweep(address(wallet), address(usd), 38, type(uint256).max, _twoHot(dgst));
+        assertEq(_balanceOf(address(usd), cold1), 42 * 1e6);
+    }
+}

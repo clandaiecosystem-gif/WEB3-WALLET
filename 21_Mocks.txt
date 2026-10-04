@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+/* =========================================================================
+   Общие моки и утилиты для тестов SmartWalletGuard v6.1.0
+   ========================================================================= */
+
+interface Vm {
+    function warp(uint256) external;
+    function prank(address) external;
+    function startPrank(address) external;
+    function stopPrank() external;
+    function expectRevert() external;
+    function expectRevert(bytes4) external;
+    function expectRevert(bytes calldata) external;
+    function assume(bool) external;
+    function sign(uint256 privateKey, bytes32 digest)
+        external pure returns (uint8 v, bytes32 r, bytes32 s);
+    function addr(uint256 privateKey) external pure returns (address);
+    function label(address, string calldata) external;
+}
+
+/// @dev Реализация ERC20 с настраиваемым балансом и учётом approve.
+contract MockERC20 {
+    string public name = "Mock";
+    uint8 public decimals = 18;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function setBalance(address who, uint256 amount) external { balanceOf[who] = amount; }
+    function setDecimals(uint8 d) external { decimals = d; }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// @dev Permit2: allowance с expiration и transferFrom по allowance Guard-а.
+contract MockPermit2 {
+    struct PackedAllowance { uint160 amount; uint48 expiration; uint48 nonce; }
+    mapping(address => mapping(address => mapping(address => PackedAllowance))) public allowance;
+
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external {
+        allowance[msg.sender][token][spender] = PackedAllowance(amount, expiration, 0);
+    }
+
+    function setAllowance(address owner, address token, address spender, uint160 amount, uint48 expiration) external {
+        allowance[owner][token][spender] = PackedAllowance(amount, expiration, 0);
+    }
+
+    function transferFrom(address from, address to, uint160 amount, address token) external {
+        PackedAllowance storage a = allowance[from][token][msg.sender];
+        require(a.amount >= amount, "permit2 amount");
+        require(a.expiration != 0 && a.expiration >= block.timestamp, "permit2 expiration");
+        a.amount -= amount;
+        MockERC20(token).transferFrom(from, to, amount);
+    }
+}
+
+/// @dev Smart Wallet: guard/permit2/paused + узкие primitive-вызовы от Guard-а.
+contract MockWallet {
+    address public guard;
+    address public permit2;
+    bool public paused;
+    address public pendingGuard;
+    uint256 public pendingGuardAt;
+    uint256 public guardDelay = 48 hours;
+    address public emergencyRecovery;
+    mapping(address => bool) public permit2Enabled;
+
+    function setGuard(address g) external { guard = g; }
+    function setPermit2(address p) external { permit2 = p; }
+    function setPaused(bool p) external { paused = p; }
+
+    function sendNativeByGuard(address payable to, uint256 amount) external {
+        require(msg.sender == guard, "only guard");
+        (bool ok, ) = to.call{ value: amount }("");
+        require(ok, "native send failed");
+    }
+
+    function proposeGuardMigration(address newGuard) external {
+        require(msg.sender == guard, "only guard");
+        pendingGuard = newGuard;
+        pendingGuardAt = block.timestamp;
+    }
+
+    function acceptGuardMigration() external {
+        require(pendingGuard != address(0), "no pending guard");
+        require(block.timestamp >= pendingGuardAt + guardDelay, "timelock");
+        require(msg.sender == pendingGuard, "only new guard");
+        guard = pendingGuard;
+        pendingGuard = address(0);
+    }
+
+    function emergencyEnablePermit2ForGuard(address token) external {
+        require(msg.sender == guard, "only guard");
+        permit2Enabled[token] = true;
+        MockPermit2(permit2).approve(token, guard, type(uint160).max, type(uint48).max);
+    }
+
+    function revokePermit2ForGuard(address token) external {
+        require(msg.sender == guard, "only guard");
+        permit2Enabled[token] = false;
+        MockPermit2(permit2).approve(token, guard, 0, 0);
+    }
+
+    receive() external payable {}
+}

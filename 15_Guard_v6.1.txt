@@ -1,0 +1,727 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { GuardOps } from "./GuardOps.sol";
+import { IERC20View, IPermit2View, ISmartWalletView, IOwnerRegistryView, IPolicyRegistryView,
+         ISubscriptionsView, IMigrationHubView } from "./GuardInterfaces.sol";
+
+/* =========================================================================
+   SmartWalletGuard v6.1.0 — Core
+   =========================================================================
+   Изменения относительно v6.0.0 (ТЗ v6.1):
+
+   1.  ADAPTER ARCHITECTURE УДАЛЕНА полностью: нет `ISwapAdapterView`,
+       `executeSwap`, `adapterPolicy`, `addAdapter/removeAdapter`, проверок
+       `adapter.guard()` и передачи токенов сначала адаптеру. Вместо этого
+       один универсальный путь — `executeOnContract`: Guard не знает функций
+       конкретного DEX, он знает только target contract, token и amount.
+   2.  Выбор пути определяется моделью policy: `executeOnContract` — расход
+       ВНУТРЬ доверенного smart contract (ContractPolicy), `transfer`/
+       `transferNative` — перевод НА адрес получателя (доля баланса).
+       Recipient и spender больше не смешиваются.
+   3.  Проверки лимитов: USD-лимит (только GREEN с настроенной ценой),
+       TokenAmountPolicy (YELLOW/RED), доля текущего баланса (всегда),
+       deadline, blocked.
+   4.  Strict-режим: для RED/UNKNOWN, при `usdLimit == 0` и при превышении
+       любого лимита требуется дополнительная подпись локального
+       security-ключа (`strictKey`), который разблокируется на устройстве.
+       Ключ хранится только на устройстве; on-chain — лишь его адрес.
+   5.  Unlimited approve блокируется; approve на конкретную сумму проходит
+       через policy и учитывается в `usdSpent`.
+   6.  Migration state больше НЕ хранится в Guard-е: `migratedOut`,
+       `migrationAccepted`, `migratedTo`, `markMigratedOut`,
+       `acceptMigrationIn` удалены. Источник истины — MigrationHub.
+   ========================================================================= */
+
+abstract contract GuardReentrancy {
+    uint256 private _locked = 1;
+    modifier nonReentrant() {
+        if (_locked != 1) revert GuardReentrancyError();
+        _locked = 2;
+        _;
+        _locked = 1;
+    }
+}
+
+error GuardReentrancyError();
+
+contract SmartWalletGuard is GuardReentrancy {
+
+    string public constant VERSION = "6.1.0";
+    address public constant NATIVE = address(0);
+
+    uint256 public constant PERM_APP_VERIFY = 1 << 0;
+    uint256 public constant PERM_EMERGENCY  = 1 << 1;
+    uint256 public constant PERM_COLD_WARM  = 1 << 2;
+    uint256 public constant PERM_P2P        = 1 << 3;
+    uint256 public constant PERM_SECURITY   = 1 << 4;
+    uint256 public constant PERM_TRADING    = 1 << 5;
+
+    uint8 internal constant KIND_WALLET = 1;
+    uint8 internal constant KIND_REVOKE_PERMIT2 = 2;
+    uint8 internal constant KIND_RECOVERY = 26;
+    uint8 internal constant KIND_STRICT_KEY = 27;
+    uint8 internal constant KIND_ON_CONTRACT = 28;
+
+    bytes32 public immutable DOMAIN_SEPARATOR;
+    address public immutable mainWallet;
+    address public immutable permit2;
+    address public immutable expectedOldGuard;
+    address public immutable ownerRegistry;
+
+    // Устанавливаются один раз в `configureModules`.
+    address public policyRegistry;
+    address public subscriptions;
+    address public migrationHub;
+
+    address public hub;
+    bool public initialized;
+
+    /// @notice Модуль применения снапшота миграции (см.
+    ///         SmartWalletGuardMigrationModule). Ему Guard делегирует
+    ///         миграционные claim-операции, чтобы не превышать лимит EVM.
+    address public migrationModule;
+
+    /// @notice Адрес локального security-ключа для strict-режима (ТЗ v6.1 §15).
+    ///         address(0) — strict-режим заблокирован (операция просто
+    ///         отклоняется, если требует strict-подпись).
+    address public strictKey;
+    address public pendingStrictKey;
+
+    address public migrationEmergencyKey;
+    address public pendingMigrationEmergencyKey;
+
+    event TransferExecuted(address indexed wallet, address indexed token, address indexed recipient, uint256 amount, uint256 nonce);
+    event NativeTransferExecuted(address indexed wallet, address indexed recipient, uint256 amount, uint256 nonce);
+    event ContractExecuted(
+        address indexed wallet, address indexed target, address indexed token,
+        uint256 amount, uint256 usdValue, address recipient, bool strict, uint256 nonce
+    );
+    event ApprovalGranted(address indexed wallet, address indexed spender, address indexed token, uint256 amount, bool strict);
+    event StrictKeyChanged(address indexed oldKey, address indexed newKey);
+    event StrictKeyProposed(address indexed current, address indexed pending);
+    event StrictKeyCancelled(address indexed current);
+    event EmergencySweepExecuted(address indexed wallet, address indexed token, address indexed recipient, uint256 amount);
+    event WalletGuardMigrationProposed(address indexed wallet, address indexed newGuard);
+    event WalletGuardMigrationAccepted(address indexed wallet);
+    event WalletPermit2Enabled(address indexed wallet, address indexed token);
+    event WalletPermit2Revoked(address indexed wallet, address indexed token);
+    event HubUpdated(address indexed oldHub, address indexed newHub);
+    event MigrationEmergencyKeyChanged(address indexed oldKey, address indexed newKey);
+    event MigrationEmergencyKeyProposed(address indexed current, address indexed pending);
+    event MigrationEmergencyKeyCancelled(address indexed current);
+    event RecoveryTargetUpdated(address indexed wallet, address indexed token, address indexed recipient, bool active);
+    event WalletRegistryClaimed(address indexed wallet, bool isHot);
+
+    error NotHub();
+    error NotMigrationHub();
+    error AlreadyInitialized();
+    error MigratedOutError();
+    error MigrationNotAccepted();
+    error DeadlineExpired();
+    error ZeroAddress();
+    error PolicyRejected();
+    error NotContract();
+    error WrongGuard();
+    error WrongPermit2();
+    error WalletPaused();
+    error WalletNotRegistered();
+    error TokenBlacklisted();
+    error TokenNotApproved();
+    error RecipientBlacklisted();
+    error AmountOutOfRange();
+    error Permit2AllowanceInsufficient();
+    error Permit2AllowanceExpired();
+    error NoRecoveryTarget();
+    error RecoveryRecipientBlacklisted();
+    error ZeroBalance();
+    error SweepTooLarge();
+    error PermissionRequired();
+    error NotPausedWallet();
+    error BadOwnerSet();
+    error UnlimitedApprove();
+    error StrictKeyNotSet();
+    error StrictSignatureInvalid();
+
+    /// @dev Обычные операции запрещены после миграции; во время применения
+    ///      снапшота исключение делается только для самого hub-а.
+    modifier notMigrated() {
+        if (msg.sender != hub) {
+            if (IMigrationHubView(migrationHub).finalizedOut(address(this))) revert MigratedOutError();
+            if (expectedOldGuard != address(0)
+                && !IMigrationHubView(migrationHub).acceptedFrom(address(this), expectedOldGuard)) {
+                revert MigrationNotAccepted();
+            }
+        }
+        _;
+    }
+
+    modifier onlyHub() {
+        if (msg.sender != hub || hub == address(0)) revert NotHub();
+        _;
+    }
+
+    /// @dev Применение снапшота миграции: только координатор, и только когда
+    ///      миграция действительно финализирована на этот Guard.
+    modifier onlyMigration() {
+        if (msg.sender != migrationModule || migrationModule == address(0)) revert NotMigrationHub();
+        if (!IMigrationHubView(migrationHub).authorizedMigration(address(this))) revert MigrationNotAccepted();
+        _;
+    }
+
+    constructor(address mainWallet_, address ownerRegistry_, address permit2_, address expectedOldGuard_) {
+        if (mainWallet_ == address(0)) revert ZeroAddress();
+        if (ownerRegistry_ == address(0) || ownerRegistry_.code.length == 0) revert NotContract();
+        if (permit2_ == address(0) || permit2_.code.length == 0) revert NotContract();
+        if (expectedOldGuard_ != address(0) && expectedOldGuard_.code.length == 0) revert NotContract();
+
+        mainWallet = mainWallet_;
+        permit2 = permit2_;
+        ownerRegistry = ownerRegistry_;
+        expectedOldGuard = expectedOldGuard_;
+
+        DOMAIN_SEPARATOR = GuardOps.domainSeparator(block.chainid, address(this));
+
+        hub = msg.sender;
+        emit HubUpdated(address(0), msg.sender);
+    }
+
+    // =========================================================================
+    // Инициализация
+    // =========================================================================
+
+    /// @notice Привязка модулей. Безопасна для любого вызывающего: каждый
+    ///         модуль обязан ссылаться ровно на этот Guard (`isBoundTo`).
+    function configureModules(
+        address policyRegistry_, address subscriptions_, address migrationHub_, address migrationModule_
+    ) external {
+        if (initialized) revert AlreadyInitialized();
+        if (policyRegistry != address(0) || subscriptions != address(0) || migrationHub != address(0)) {
+            revert AlreadyInitialized();
+        }
+        if (policyRegistry_ == address(0) || policyRegistry_.code.length == 0) revert NotContract();
+        if (subscriptions_ == address(0) || subscriptions_.code.length == 0) revert NotContract();
+        if (migrationHub_ == address(0) || migrationHub_.code.length == 0) revert NotContract();
+        if (!IPolicyRegistryView(policyRegistry_).isBoundTo(address(this))) revert WrongGuard();
+        if (!ISubscriptionsView(subscriptions_).isBoundTo(address(this))) revert WrongGuard();
+        if (!IMigrationHubView(migrationHub_).isBoundTo(address(this))) revert WrongGuard();
+        if (migrationModule_ == address(0) || migrationModule_.code.length == 0) revert NotContract();
+        policyRegistry = policyRegistry_;
+        subscriptions = subscriptions_;
+        migrationHub = migrationHub_;
+        migrationModule = migrationModule_;
+    }
+
+    /// @notice Фиксация состава владельцев. Только hub (развёртыватель или
+    ///         координатор миграции целевого Guard-а).
+    function initializeOwners(address[] calldata owners_, bool[] calldata isHot_) external onlyHub {
+        if (initialized) revert AlreadyInitialized();
+        IOwnerRegistryView(ownerRegistry).initialize(owners_, isHot_);
+        initialized = true;
+    }
+
+    // =========================================================================
+    // Views
+    // =========================================================================
+
+
+    /// @dev Маска прав вычисляется в самом Guard-е из активного плана. Это
+    ///      убирает зависимость авторизации от логики внешнего контракта:
+    ///      Manager отдаёт только план, решение о правах принимает Guard
+    ///      (ТЗ v5.1.4 §100).
+    function _mask() internal view returns (uint256) {
+        if (ISubscriptionsView(subscriptions).activePlan() == 0) {
+            return PERM_APP_VERIFY | PERM_EMERGENCY;
+        }
+        return PERM_APP_VERIFY | PERM_EMERGENCY | PERM_COLD_WARM | PERM_P2P | PERM_SECURITY | PERM_TRADING;
+    }
+
+
+    function hasPermission(uint256 permission) external view returns (bool) {
+        return permission != 0 && (_mask() & permission) == permission;
+    }
+
+
+
+
+
+    function domainSeparator() external view returns (bytes32) { return DOMAIN_SEPARATOR; }
+
+    // =========================================================================
+    // Digest helpers (клиенты считают digest сами; эти функции для сверки)
+    // =========================================================================
+
+
+
+
+
+
+
+    // =========================================================================
+    // ERC20 transfer на адрес получателя — 2/3 Hot + PERM_COLD_WARM|PERM_SECURITY
+    // =========================================================================
+
+    function transfer(
+        address hotWallet, address token, address recipient, uint256 amount,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        _requirePermission(PERM_COLD_WARM | PERM_SECURITY);
+        if (amount == 0 || amount > type(uint160).max) revert AmountOutOfRange();
+        if (token == NATIVE) revert ZeroAddress();
+        _checkHotWallet(hotWallet);
+        if (recipient == address(0)) revert ZeroAddress();
+        if (IPolicyRegistryView(policyRegistry).blacklist(recipient)) revert RecipientBlacklisted();
+        _checkToken(token);
+        _checkDeadline(deadline);
+
+        // Доля баланса: даже дешёвый токен не позволяет вывести весь баланс
+        // одним переводом на произвольный адрес (ТЗ v6.1 §10).
+        uint256 shareBps = IPolicyRegistryView(policyRegistry).defaultTransferShareBps();
+        IPolicyRegistryView(policyRegistry).checkTransferShare(hotWallet, token, amount, shareBps);
+
+        _checkPermit2Allowance(hotWallet, token, amount);
+        _verifyHot(
+            GuardOps.transferHash(hotWallet, token, recipient, amount, nonce, deadline),
+            hotWallet, nonce, signatures
+        );
+
+        IPermit2View(permit2).transferFrom(hotWallet, recipient, uint160(amount), token);
+        emit TransferExecuted(hotWallet, token, recipient, amount, nonce);
+    }
+
+    // =========================================================================
+    // Native transfer — 2/3 Hot + PERM_COLD_WARM|PERM_SECURITY
+    // =========================================================================
+
+    function transferNative(
+        address hotWallet, address payable recipient, uint256 amount,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        _requirePermission(PERM_COLD_WARM | PERM_SECURITY);
+        if (amount == 0) revert AmountOutOfRange();
+        _checkHotWallet(hotWallet);
+        if (recipient == address(0)) revert ZeroAddress();
+        if (IPolicyRegistryView(policyRegistry).blacklist(recipient)) revert RecipientBlacklisted();
+        _checkDeadline(deadline);
+
+        _verifyHot(
+            GuardOps.nativeTransferHash(hotWallet, recipient, amount, nonce, deadline),
+            hotWallet, nonce, signatures
+        );
+
+        ISmartWalletView(hotWallet).sendNativeByGuard(recipient, amount);
+        emit NativeTransferExecuted(hotWallet, recipient, amount, nonce);
+    }
+
+    // =========================================================================
+    // Расход ВНУТРЬ доверенного smart contract — универсальный путь вместо
+    // adapter architecture (ТЗ v6.1 §1, §22, §24, §54)
+    // =========================================================================
+
+    /// @notice Расход токена в пользу доверенного контракта (DEX, протокол,
+    ///         любой smart contract). Guard не знает, что этот контракт делает:
+    ///         он применяет ContractPolicy + TokenRisk + лимиты.
+    /// @param target    доверенный контракт, которому уходит token
+    /// @param token     расходуемый токен
+    /// @param amount    количество
+    /// @param recipient получатель результата операции (для адаптеров больше
+    ///                  не используется, остаётся информационным и входит в подпись)
+    /// @param strict    требуется ли strict-подпись локального ключа; значение
+    ///                  входит в digest, поэтому подпись нельзя переиспользовать
+    /// @param strictSignature  подпись strictKey (проверяется, если strict = true)
+    function executeOnContract(
+        address hotWallet, address target, address token, uint256 amount, address recipient,
+        bool strict, uint256 nonce, uint256 deadline,
+        bytes calldata strictSignature, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        _requirePermission(PERM_TRADING | PERM_SECURITY);
+        if (amount == 0 || amount > type(uint160).max) revert AmountOutOfRange();
+        if (token == NATIVE || target == NATIVE) revert ZeroAddress();
+        if (target.code.length == 0) revert NotContract();
+        _checkHotWallet(hotWallet);
+        _checkToken(token);
+        _checkDeadline(deadline);
+
+        bytes32 digest = _digestOf(GuardOps.onContractHash(
+            mainWallet, hotWallet, target, token, amount, recipient, strict, nonce, deadline
+        ));
+
+        if (strict) _checkStrictKey(digest, strictSignature);
+        _verifyHot(digest, hotWallet, nonce, signatures);
+
+        // Policy-проверки выполняет Registry: ContractPolicy + категория токена
+        // + USD-лимит + доля баланса + absolute amount + deadline + blocked.
+        uint256 usdValue = IPolicyRegistryView(policyRegistry).checkAndSpend(
+            hotWallet, target, token, amount, strict
+        );
+
+        _checkPermit2Allowance(hotWallet, token, amount);
+        IPermit2View(permit2).transferFrom(hotWallet, target, uint160(amount), token);
+
+        emit ContractExecuted(hotWallet, target, token, amount, usdValue, recipient, strict, nonce);
+    }
+
+    // =========================================================================
+    // Approve через Guard — защита от unlimited и учёт в policy (ТЗ v6.1 §12-§14)
+    // =========================================================================
+
+    /// @notice Approve на конкретную сумму в пользу доверенного контракта.
+    ///         Unlimited approve отклоняется. Списывается в `usdSpent`.
+    /// @dev Кошелёк должен вызывать approve только через Guard; это требование
+    ///      к реализации Smart Wallet (см. REVIEW).
+    function approveOnContract(
+        address hotWallet, address spender, address token, uint256 amount,
+        bool strict, uint256 nonce, uint256 deadline,
+        bytes calldata strictSignature, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        _requirePermission(PERM_TRADING | PERM_SECURITY);
+        if (amount == type(uint256).max) revert UnlimitedApprove();
+        if (amount == 0) revert AmountOutOfRange();
+        if (token == NATIVE || spender == NATIVE) revert ZeroAddress();
+        if (spender.code.length == 0) revert NotContract();
+        _checkHotWallet(hotWallet);
+        _checkToken(token);
+        _checkDeadline(deadline);
+
+        bytes32 digest = _digestOf(GuardOps.approveHash(
+            mainWallet, hotWallet, spender, token, amount, strict, nonce, deadline
+        ));
+
+        if (strict) _checkStrictKey(digest, strictSignature);
+        _verifyHot(digest, hotWallet, nonce, signatures);
+
+        // Проверка + учёт расхода в одной операции: множество approve не может
+        // обойти общий лимит, потому что второй approve уже не пройдёт.
+        IPolicyRegistryView(policyRegistry).checkAndSpend(hotWallet, spender, token, amount, strict);
+
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(0x095ea7b3, spender, amount)
+        );
+        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) revert PolicyRejected();
+
+        emit ApprovalGranted(hotWallet, spender, token, amount, strict);
+    }
+
+    // =========================================================================
+    // Emergency sweep — 2/3 Hot, без подписки, policy и whitelist
+    // =========================================================================
+
+    function emergencySweep(
+        address wallet, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        if (!IOwnerRegistryView(ownerRegistry).isRegisteredWallet(wallet)) revert WalletNotRegistered();
+        if (!ISmartWalletView(wallet).paused()) revert NotPausedWallet();
+
+        IPolicyRegistryView reg = IPolicyRegistryView(policyRegistry);
+        (bool exists, address storedRecipient) = reg.getRecoveryTarget(wallet, token);
+        if (!exists) revert NoRecoveryTarget();
+        if (reg.blacklist(storedRecipient)) revert RecoveryRecipientBlacklisted();
+        if (token != NATIVE && reg.blacklist(token)) revert TokenBlacklisted();
+
+        _checkDeadline(deadline);
+        _verifyHot(
+            GuardOps.sweepHash(wallet, token, storedRecipient, nonce, deadline),
+            wallet, nonce, signatures
+        );
+
+        uint256 amount;
+        if (token == NATIVE) {
+            amount = wallet.balance;
+            if (amount == 0) revert ZeroBalance();
+            ISmartWalletView(wallet).sendNativeByGuard(payable(storedRecipient), amount);
+        } else {
+            amount = IERC20View(token).balanceOf(wallet);
+            if (amount == 0) revert ZeroBalance();
+            if (amount > type(uint160).max) revert SweepTooLarge();
+            ISmartWalletView(wallet).emergencyEnablePermit2ForGuard(token);
+            _checkPermit2Allowance(wallet, token, amount);
+            IPermit2View(permit2).transferFrom(wallet, storedRecipient, uint160(amount), token);
+        }
+        emit EmergencySweepExecuted(wallet, token, storedRecipient, amount);
+    }
+
+    // =========================================================================
+    // Recovery target — 3/5 + Cold
+    // =========================================================================
+
+    function setRecoveryTarget(
+        address wallet, address token, address recipient,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        if (!IOwnerRegistryView(ownerRegistry).isRegisteredWallet(wallet)) revert WalletNotRegistered();
+        if (recipient == address(0)) revert ZeroAddress();
+        IPolicyRegistryView reg = IPolicyRegistryView(policyRegistry);
+        if (reg.blacklist(recipient)) revert RecipientBlacklisted();
+        if (token != NATIVE && !reg.approvedToken(token)) revert TokenNotApproved();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_RECOVERY, 20, wallet, token, uint160(recipient), 0, nonce, deadline
+            )),
+            signatures,
+            true
+        );
+        ISubscriptionsView(subscriptions).setRecoveryTarget(wallet, token, recipient);
+        emit RecoveryTargetUpdated(wallet, token, recipient, true);
+    }
+
+    function removeRecoveryTarget(
+        address wallet, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        (bool targetExists, ) = IPolicyRegistryView(policyRegistry).getRecoveryTarget(wallet, token);
+        if (!targetExists) revert NoRecoveryTarget();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_RECOVERY, 21, wallet, token, 0, 0, nonce, deadline
+            )),
+            signatures,
+            true
+        );
+        ISubscriptionsView(subscriptions).removeRecoveryTarget(wallet, token);
+        emit RecoveryTargetUpdated(wallet, token, address(0), false);
+    }
+
+    // =========================================================================
+    // Strict key (локальный security-ключ) — 3/5 + Cold
+    // =========================================================================
+
+    /// @notice Предлагает новый strict-ключ. Применяется самим ключом, поэтому
+    ///         скомпрометированные owners не могут подменить его молча.
+    function proposeStrictKey(address newKey, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external notMigrated
+    {
+        if (newKey == address(0)) revert ZeroAddress();
+        if (newKey.code.length != 0) revert NotContract();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_STRICT_KEY, 1, newKey, address(0), 0, 0, nonce, deadline
+            )),
+            signatures,
+            true
+        );
+        pendingStrictKey = newKey;
+        emit StrictKeyProposed(strictKey, newKey);
+    }
+
+    function acceptStrictKey() external {
+        if (msg.sender != pendingStrictKey) revert StrictSignatureInvalid();
+        address old = strictKey;
+        strictKey = pendingStrictKey;
+        pendingStrictKey = address(0);
+        emit StrictKeyChanged(old, strictKey);
+    }
+
+    function cancelStrictKey(uint256 nonce, uint256 deadline, bytes[] calldata signatures) external notMigrated {
+        if (pendingStrictKey == address(0)) revert ZeroAddress();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_STRICT_KEY, 2, address(0), address(0), 0, 0, nonce, deadline
+            )),
+            signatures,
+            true
+        );
+        pendingStrictKey = address(0);
+        emit StrictKeyCancelled(strictKey);
+    }
+
+    function _checkStrictKey(bytes32 digest, bytes calldata strictSignature) internal view {
+        address key = strictKey;
+        if (key == address(0)) revert StrictKeyNotSet();
+        address signer = GuardOps.recover(digest, strictSignature);
+        if (signer != key) revert StrictSignatureInvalid();
+    }
+
+    // =========================================================================
+    // Owners и wallet registry — 3/5 + Cold / 2/3 Hot
+    // =========================================================================
+
+    function changeOwners(
+        address[] calldata newOwners, bool[] calldata newIsHot,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        if (newOwners.length != 5 || newIsHot.length != 5) revert BadOwnerSet();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.changeOwnersHash(
+                mainWallet, keccak256(abi.encode(newOwners)), keccak256(abi.encode(newIsHot)), nonce, deadline
+            )),
+            signatures,
+            true
+        );
+        IOwnerRegistryView(ownerRegistry).changeOwners(newOwners, newIsHot);
+    }
+
+    function addWallet(address wallet, bool isHot, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external nonReentrant notMigrated
+    {
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_WALLET, 1, wallet, address(0), isHot ? 1 : 0, 0, nonce, deadline
+            )),
+            signatures,
+            false
+        );
+        IOwnerRegistryView(ownerRegistry).addWallet(wallet, isHot);
+    }
+
+    function removeWallet(address wallet, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external nonReentrant notMigrated
+    {
+        if (!IOwnerRegistryView(ownerRegistry).isRegisteredWallet(wallet)) revert WalletNotRegistered();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_WALLET, 2, wallet, address(0), 0, 0, nonce, deadline
+            )),
+            signatures,
+            false
+        );
+        IOwnerRegistryView(ownerRegistry).removeWallet(wallet);
+    }
+
+    // =========================================================================
+    // Подписка
+    // =========================================================================
+
+    function subscribe(
+        uint8 plan, address fromWallet, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external notMigrated {
+        ISubscriptionsView(subscriptions).subscribe(plan, fromWallet, nonce, deadline, signatures);
+    }
+
+    // =========================================================================
+    // Миграция: состояние живёт в MigrationHub
+    // =========================================================================
+
+    function setHub(address newHub) external {
+        if (msg.sender != hub && !(newHub == msg.sender && !initialized)) revert NotHub();
+        if (newHub == address(0)) revert ZeroAddress();
+        address old = hub;
+        hub = newHub;
+        if (subscriptions != address(0)) ISubscriptionsView(subscriptions).setHub(newHub);
+        emit HubUpdated(old, newHub);
+    }
+
+
+
+
+
+    function claimPolicy(
+        uint8 kind, address a, address b, uint256 limit, uint256 deadline, address recipient
+    ) external onlyMigration {
+        ISubscriptionsView(subscriptions).claimPolicy(kind, a, b, limit, deadline, recipient);
+    }
+
+
+    function claimStrictKey(address key) external onlyMigration {
+        if (key.code.length != 0) revert NotContract();
+        emit StrictKeyChanged(strictKey, key);
+        strictKey = key;
+    }
+
+
+
+
+    /// @notice Завершает миграцию кошелька на этом (новом) Guard-е.
+    ///         Вызывается MigrationHub-ом (ТЗ v6.1 §32).
+    function acceptWalletGuardMigration(address wallet) external onlyMigration {
+        if (expectedOldGuard == address(0)) revert MigrationNotAccepted();
+        if (wallet.code.length == 0) revert NotContract();
+        if (ISmartWalletView(wallet).guard() != expectedOldGuard) revert WrongGuard();
+        ISmartWalletView(wallet).acceptGuardMigration();
+        if (ISmartWalletView(wallet).guard() != address(this)) revert WrongGuard();
+        emit WalletGuardMigrationAccepted(wallet);
+    }
+
+
+    /// @notice Потребляет governance-nonce по требованию координатора миграции.
+    function consumeGovernanceNonce(uint256 nonce) external returns (bool) {
+        if (migrationHub == address(0)) return false;
+        address hubAddr = hub;
+        if (msg.sender != migrationHub && msg.sender != hubAddr) return false;
+        return IOwnerRegistryView(ownerRegistry).tryConsumeNonce(mainWallet, nonce);
+    }
+
+
+
+
+    function revokePermit2OnWallet(
+        address wallet, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external nonReentrant notMigrated {
+        if (token == NATIVE) revert ZeroAddress();
+        if (ISmartWalletView(wallet).guard() != address(this)) revert WrongGuard();
+        _checkDeadline(deadline);
+        IOwnerRegistryView(ownerRegistry).consumeNonce(mainWallet, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(
+            _digestOf(GuardOps.policyHashAddrs(
+                address(this), KIND_REVOKE_PERMIT2, 1, wallet, token, 0, 0, nonce, deadline
+            )),
+            signatures,
+            false
+        );
+        ISmartWalletView(wallet).revokePermit2ForGuard(token);
+        emit WalletPermit2Revoked(wallet, token);
+    }
+
+    function acceptMigrationEmergencyKey() external {
+        if (msg.sender != pendingMigrationEmergencyKey) revert NotHub();
+        address old = migrationEmergencyKey;
+        migrationEmergencyKey = pendingMigrationEmergencyKey;
+        pendingMigrationEmergencyKey = address(0);
+        emit MigrationEmergencyKeyChanged(old, migrationEmergencyKey);
+    }
+
+    // =========================================================================
+    // Internal
+    // =========================================================================
+
+    function _digestOf(bytes32 structHash) internal view returns (bytes32) {
+        return GuardOps.digestOf(DOMAIN_SEPARATOR, structHash);
+    }
+
+    function _requirePermission(uint256 permission) internal view {
+        uint256 mask = _mask();
+        if (permission == 0 || (mask & permission) != permission) revert PermissionRequired();
+    }
+
+    function _checkDeadline(uint256 deadline) internal view {
+        if (block.timestamp > deadline) revert DeadlineExpired();
+    }
+
+    function _checkHotWallet(address wallet) internal view {
+        if (!IOwnerRegistryView(ownerRegistry).isHotWallet(wallet)) revert WalletNotRegistered();
+        if (wallet.code.length == 0) revert NotContract();
+        if (ISmartWalletView(wallet).guard() != address(this)) revert WrongGuard();
+        if (ISmartWalletView(wallet).permit2() != permit2) revert WrongPermit2();
+        if (ISmartWalletView(wallet).paused()) revert WalletPaused();
+    }
+
+    function _checkToken(address token) internal view {
+        IPolicyRegistryView reg = IPolicyRegistryView(policyRegistry);
+        if (reg.blacklist(token)) revert TokenBlacklisted();
+        if (!reg.approvedToken(token)) revert TokenNotApproved();
+    }
+
+    function _checkPermit2Allowance(address wallet, address token, uint256 amount) internal view {
+        (uint160 allowed, uint48 expiration, ) = IPermit2View(permit2).allowance(wallet, token, address(this));
+        if (uint256(allowed) < amount) revert Permit2AllowanceInsufficient();
+        // expiration == 0 у Permit2 означает истёкший allowance (ТЗ §41).
+        if (expiration == 0 || uint256(expiration) < block.timestamp) revert Permit2AllowanceExpired();
+    }
+
+    function _verifyHot(bytes32 digest, address scope, uint256 nonce, bytes[] calldata signatures) internal {
+        IOwnerRegistryView(ownerRegistry).consumeNonce(scope, nonce);
+        IOwnerRegistryView(ownerRegistry).requireSignatures(digest, signatures, false);
+    }
+}

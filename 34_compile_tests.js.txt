@@ -1,0 +1,65 @@
+const fs = require('fs');
+const path = require('path');
+
+// Minimal solc standard-JSON input for the test files, so we can typecheck the
+// Foundry tests even when forge itself cannot spawn its solc child process.
+const W = String.raw`C:\Users\Виталя\Documents\deepseek-harness\default-workspace`;
+const contracts = path.join(W, 'contracts');
+const tests = path.join(W, 'test');
+
+const files = {
+  'contracts/GuardOps.sol': path.join(contracts, 'GuardOps.sol'),
+  'contracts/GuardInterfaces.sol': path.join(contracts, 'GuardInterfaces.sol'),
+  'contracts/SmartWalletGuardOwnerRegistry-v6.0.0.sol': path.join(contracts, 'SmartWalletGuardOwnerRegistry-v6.0.0.sol'),
+  'contracts/SmartWalletPolicyRegistry-v6.1.0.sol': path.join(contracts, 'SmartWalletPolicyRegistry-v6.1.0.sol'),
+  'contracts/SmartWalletGuardSubscriptions-v6.0.0.sol': path.join(contracts, 'SmartWalletGuardSubscriptions-v6.0.0.sol'),
+  'contracts/SmartWalletGuard-v6.1.0.sol': path.join(contracts, 'SmartWalletGuard-v6.1.0.sol'),
+  'contracts/SmartWalletGuardMigrationModule-v6.1.0.sol': path.join(contracts, 'SmartWalletGuardMigrationModule-v6.1.0.sol'),
+  'contracts/SmartWalletMigrationHub-v6.1.0.sol': path.join(contracts, 'SmartWalletMigrationHub-v6.1.0.sol'),
+};
+for (const f of fs.readdirSync(tests)) {
+  if (f.endsWith('.sol')) files['test/' + f] = path.join(tests, f);
+}
+
+const sources = {};
+for (const [name, p] of Object.entries(files)) {
+  sources[name] = { content: fs.readFileSync(p, 'utf8') };
+}
+
+const input = {
+  language: 'Solidity',
+  sources,
+  settings: {
+    optimizer: { enabled: true, runs: 200 },
+    viaIR: true,
+    outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object'] } },
+  },
+};
+
+const outDir = path.join(W, 'build-tests');
+fs.mkdirSync(outDir, { recursive: true });
+const ip = path.join(outDir, 'input.json');
+const op = path.join(outDir, 'output.json');
+fs.writeFileSync(ip, JSON.stringify(input));
+
+const { execFileSync } = require('child_process');
+execFileSync(process.execPath, [path.join(__dirname, 'solc-driver.js'), path.join(__dirname, 'soljson-0.8.30.js'), ip, op], { stdio: 'ignore' });
+
+const out = JSON.parse(fs.readFileSync(op, 'utf8'));
+const errs = (out.errors || []).filter((e) => e.severity === 'error');
+const warns = (out.errors || []).filter((e) => e.severity === 'warning');
+for (const e of errs) console.log('ERROR', e.formattedMessage);
+for (const w of warns) console.log('WARN', w.formattedMessage.split('\n')[0]);
+
+let testCount = 0;
+for (const file of Object.keys(out.contracts || {})) {
+  for (const name of Object.keys(out.contracts[file])) {
+    const abi = out.contracts[file][name].abi || [];
+    const fns = abi.filter((i) => i.type === 'function' && i.name && i.name.startsWith('test'));
+    if (fns.length) {
+      console.log(`${name}: ${fns.length} test functions`);
+      testCount += fns.length;
+    }
+  }
+}
+console.log(`\n${errs.length} errors, ${warns.length} warnings, ${testCount} test functions discoverable`);

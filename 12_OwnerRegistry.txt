@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { GuardOps } from "./GuardOps.sol";
+
+/* =========================================================================
+   SmartWalletGuard v6.0.0 — Owner Registry
+   =========================================================================
+   Единственный источник истины по governance-владельцам (5 owners, 3 Hot /
+   2 Cold) и по consumed nonce-ам. Вынесен из Guard-а, чтобы:
+     - Guard и SubscriptionManager использовали один и тот же verifier
+       (нельзя выдать entitlement в обход подписей);
+     - runtime bytecode каждого контракта уложился в лимит EVM 24 576 байт.
+
+   Доступ: все мутирующие функции вызывает только `guard`, который сам
+   проверяет, что действие авторизовано (подписи владельцев или hub-миграция).
+   ========================================================================= */
+
+contract SmartWalletGuardOwnerRegistry {
+
+    string public constant VERSION = "6.0.0";
+    address public constant NATIVE = address(0);
+
+    uint256 public constant HOT_THRESHOLD = 2;
+    uint256 public constant CRITICAL_THRESHOLD = 3;
+    uint256 public constant TOTAL_OWNERS = 5;
+    uint256 public constant HOT_OWNERS = 3;
+
+    struct OwnerInfo { bool isOwner; bool isHot; }
+
+    address public immutable permit2;
+
+    /// @dev Устанавливается один раз через `setGuard`.
+    address public guard;
+
+    address[] private _owners;
+    mapping(address => OwnerInfo) public ownerInfo;
+    mapping(address => mapping(uint256 => bool)) public usedNonces;
+
+    address[] private _hotWallets;
+    address[] private _coldWallets;
+    mapping(address => uint256) private _hotIdx;
+    mapping(address => uint256) private _coldIdx;
+
+    event OwnerChanged(address indexed owner, bool isHot, bool active);
+    event HotWalletUpdated(address indexed wallet, bool active);
+    event ColdWalletUpdated(address indexed wallet, bool active);
+
+    error NotGuard();
+    error AlreadyInitialized();
+    error NotInitialized();
+    error BadOwnerSet();
+    error ZeroAddress();
+    error NotContract();
+    error NonceUsed();
+    error ThresholdNotMet();
+    error TooManySignatures();
+    error NotAnOwner();
+    error DuplicateSigner();
+    error ColdOwnerRequired();
+    error WalletAlreadyRegistered();
+    error WalletNotRegistered();
+    error WrongGuard();
+    error WrongPermit2();
+    error DeadlineExpired();
+
+    modifier onlyGuard() {
+        if (msg.sender != guard) revert NotGuard();
+        _;
+    }
+
+    constructor(address permit2_) {
+        if (permit2_ == address(0) || permit2_.code.length == 0) revert NotContract();
+        permit2 = permit2_;
+    }
+
+    /// @notice Разовая привязка к Guard-у. Вызывающий обязан быть Guard-ом,
+    ///         который сам ссылается на этот OwnerRegistry, — поэтому
+    ///         привязаться может только «правильный» Guard.
+    function setGuard(address guard_) external {
+        if (guard != address(0)) revert AlreadyInitialized();
+        if (guard_ == address(0) || guard_.code.length == 0) revert NotContract();
+        if (ISmartWalletMin(guard_).guard() != address(this)) revert WrongGuard();
+        guard = guard_;
+    }
+
+    // =========================================================================
+    // Инициализация
+    // =========================================================================
+
+    /// @notice Устанавливает исходный состав владельцев. Однократно.
+    function initialize(address[] calldata newOwners, bool[] calldata newIsHot) external onlyGuard {
+        if (_owners.length != 0) revert AlreadyInitialized();
+        _validate(newOwners, newIsHot);
+        _apply(newOwners, newIsHot);
+    }
+
+    /// @notice Замена состава владельцев (обычная ротация).
+    function changeOwners(address[] calldata newOwners, bool[] calldata newIsHot) external onlyGuard {
+        if (_owners.length == 0) revert NotInitialized();
+        _validate(newOwners, newIsHot);
+        _apply(newOwners, newIsHot);
+    }
+
+    function _validate(address[] calldata newOwners, bool[] calldata newIsHot) internal pure {
+        if (newOwners.length != TOTAL_OWNERS || newIsHot.length != TOTAL_OWNERS) revert BadOwnerSet();
+        uint256 hot;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            address o = newOwners[i];
+            if (o == address(0)) revert ZeroAddress();
+            for (uint256 j = 0; j < i; j++) {
+                if (newOwners[j] == o) revert BadOwnerSet();
+            }
+            if (newIsHot[i]) hot++;
+        }
+        if (hot != HOT_OWNERS) revert BadOwnerSet();
+    }
+
+    function _apply(address[] calldata newOwners, bool[] calldata newIsHot) internal {
+        uint256 oldLen = _owners.length;
+        for (uint256 i = 0; i < oldLen; i++) {
+            address old = _owners[i];
+            delete ownerInfo[old];
+            emit OwnerChanged(old, false, false);
+        }
+        delete _owners;
+        for (uint256 i = 0; i < TOTAL_OWNERS; i++) {
+            address o = newOwners[i];
+            ownerInfo[o] = OwnerInfo(true, newIsHot[i]);
+            _owners.push(o);
+            emit OwnerChanged(o, newIsHot[i], true);
+        }
+    }
+
+    // =========================================================================
+    // Wallet registry (2/3 Hot)
+    // =========================================================================
+
+    /// @notice Добавляет Smart Wallet. Обёртка вокруг `_addWallet`, доступная
+    ///         только Guard-у (Guard сам проверяет подписи и реестр).
+    function addWallet(address wallet, bool isHot) external onlyGuard {
+        _addWallet(wallet, isHot);
+    }
+
+    function _addWallet(address wallet, bool isHot) internal {
+        if (wallet == address(0)) revert ZeroAddress();
+        if (wallet.code.length == 0) revert NotContract();
+        if (ISmartWalletMin(wallet).guard() != guard) revert WrongGuard();
+        if (ISmartWalletMin(wallet).permit2() != permit2) revert WrongPermit2();
+        if (_hotIdx[wallet] != 0 || _coldIdx[wallet] != 0) revert WalletAlreadyRegistered();
+
+        if (isHot) {
+            _hotWallets.push(wallet);
+            _hotIdx[wallet] = _hotWallets.length;
+            emit HotWalletUpdated(wallet, true);
+        } else {
+            _coldWallets.push(wallet);
+            _coldIdx[wallet] = _coldWallets.length;
+            emit ColdWalletUpdated(wallet, true);
+        }
+    }
+
+    function removeWallet(address wallet) external onlyGuard {
+        bool isHot = _hotIdx[wallet] != 0;
+        bool isCold = _coldIdx[wallet] != 0;
+        if (!isHot && !isCold) revert WalletNotRegistered();
+        if (isHot) _removeEnum(_hotWallets, _hotIdx, wallet);
+        else _removeEnum(_coldWallets, _coldIdx, wallet);
+        if (isHot) emit HotWalletUpdated(wallet, false);
+        else emit ColdWalletUpdated(wallet, false);
+    }
+
+    function _removeEnum(address[] storage list, mapping(address => uint256) storage idx, address w) internal {
+        uint256 pos = idx[w];
+        uint256 last = list.length;
+        if (pos != last) {
+            address moved = list[last - 1];
+            list[pos - 1] = moved;
+            idx[moved] = pos;
+        }
+        list.pop();
+        delete idx[w];
+    }
+
+    // =========================================================================
+    // Nonce
+    // =========================================================================
+
+    /// @notice Потребляет nonce в указанном scope (mainWallet или hot wallet).
+    function consumeNonce(address scope, uint256 nonce) external onlyGuard {
+        if (usedNonces[scope][nonce]) revert NonceUsed();
+        usedNonces[scope][nonce] = true;
+    }
+
+    /// @notice Не reverting-вариант: нужен координатору миграции, который
+    ///         проверяет подписи через Guard и затем потребляет nonce.
+    function tryConsumeNonce(address scope, uint256 nonce) external onlyGuard returns (bool) {
+        if (usedNonces[scope][nonce]) return false;
+        usedNonces[scope][nonce] = true;
+        return true;
+    }
+
+    // =========================================================================
+    // Проверка подписей
+    // =========================================================================
+
+    function verifySignatures(bytes32 dgst, bytes[] calldata sigs, bool critical) public view returns (bool) {
+        uint256 len = sigs.length;
+        if (len < (critical ? CRITICAL_THRESHOLD : HOT_THRESHOLD)) return false;
+        if (len > TOTAL_OWNERS) return false;
+        address[] memory seen = new address[](len);
+        uint256 hot;
+        uint256 cold;
+        for (uint256 i = 0; i < len; i++) {
+            address s = GuardOps.recover(dgst, sigs[i]);
+            OwnerInfo memory info = ownerInfo[s];
+            if (!info.isOwner) return false;
+            for (uint256 j = 0; j < i; j++) {
+                if (seen[j] == s) return false;
+            }
+            seen[i] = s;
+            if (info.isHot) hot++;
+            else cold++;
+        }
+        if (critical) return cold > 0;
+        return hot >= HOT_THRESHOLD;
+    }
+
+    /// @notice Reverting-вариант для внутреннего использования Guard-ом.
+    function requireSignatures(bytes32 dgst, bytes[] calldata sigs, bool critical) external view {
+        uint256 len = sigs.length;
+        if (len < (critical ? CRITICAL_THRESHOLD : HOT_THRESHOLD)) revert ThresholdNotMet();
+        if (len > TOTAL_OWNERS) revert TooManySignatures();
+        address[] memory seen = new address[](len);
+        uint256 hot;
+        uint256 cold;
+        for (uint256 i = 0; i < len; i++) {
+            address s = GuardOps.recover(dgst, sigs[i]);
+            OwnerInfo memory info = ownerInfo[s];
+            if (!info.isOwner) revert NotAnOwner();
+            for (uint256 j = 0; j < i; j++) {
+                if (seen[j] == s) revert DuplicateSigner();
+            }
+            seen[i] = s;
+            if (info.isHot) hot++;
+            else cold++;
+        }
+        if (critical) {
+            if (cold == 0) revert ColdOwnerRequired();
+        } else if (hot < HOT_THRESHOLD) {
+            revert ThresholdNotMet();
+        }
+    }
+
+    // =========================================================================
+    // Views
+    // =========================================================================
+
+    function getOwners() external view returns (address[] memory) { return _owners; }
+    function ownerCount() external view returns (uint256) { return _owners.length; }
+    function isOwnerHot(address owner) external view returns (bool) { return ownerInfo[owner].isHot; }
+    function isOwner(address owner) external view returns (bool) { return ownerInfo[owner].isOwner; }
+    function isNonceUsed(address scope, uint256 nonce) external view returns (bool) { return usedNonces[scope][nonce]; }
+    function getHotWallets() external view returns (address[] memory) { return _hotWallets; }
+    function getColdWallets() external view returns (address[] memory) { return _coldWallets; }
+    function isRegisteredWallet(address wallet) external view returns (bool) {
+        return _hotIdx[wallet] != 0 || _coldIdx[wallet] != 0;
+    }
+    function isHotWallet(address wallet) external view returns (bool) { return _hotIdx[wallet] != 0; }
+    function isColdWallet(address wallet) external view returns (bool) { return _coldIdx[wallet] != 0; }
+}
+
+interface ISmartWalletMin {
+    function guard() external view returns (address);
+    function permit2() external view returns (address);
+}

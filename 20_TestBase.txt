@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+/* =========================================================================
+   Минимальная тестовая база без внешней зависимости forge-std.
+   Используется cheatcode-адрес Foundry и обычные custom errors для провала
+   теста (Foundry считает revert провалом).
+   ========================================================================= */
+
+interface Vm {
+    function warp(uint256 newTimestamp) external;
+    function roll(uint256 newHeight) external;
+    function deal(address to, uint256 give) external;
+    function prank(address msgSender) external;
+    function startPrank(address msgSender) external;
+    function stopPrank() external;
+    function expectRevert() external;
+    function expectRevert(bytes4 selector) external;
+    function expectRevert(bytes calldata revertData) external;
+    function expectEmit(bool a, bool b, bool c, bool d) external;
+    function assume(bool condition) external;
+    function sign(uint256 privateKey, bytes32 digest)
+        external pure returns (uint8 v, bytes32 r, bytes32 s);
+    function addr(uint256 privateKey) external pure returns (address);
+    function label(address account, string calldata newLabel) external;
+    function snapshot() external returns (uint256);
+    function revertTo(uint256 snapshotId) external returns (bool);
+    function load(address target, bytes32 slot) external view returns (bytes32);
+    function store(address target, bytes32 slot, bytes32 value) external;
+}
+
+library console {
+    function log(string memory) internal pure {}
+    function log(string memory, uint256) internal pure {}
+    function log(string memory, address) internal pure {}
+}
+
+error AssertionFailed();
+error AssertionFailedWithValues(uint256 left, uint256 right);
+
+contract GuardTestBase {
+    Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    /// @dev Индекс тестового контракта (Foundry подставляет адрес теста).
+    address internal constant TEST_CONTRACT = address(0);
+
+    function fail() internal pure {
+        revert AssertionFailed();
+    }
+
+    function assertTrue(bool value) internal pure {
+        if (!value) revert AssertionFailed();
+    }
+
+    function assertFalse(bool value) internal pure {
+        if (value) revert AssertionFailed();
+    }
+
+    function assertEq(uint256 left, uint256 right) internal pure {
+        if (left != right) revert AssertionFailedWithValues(left, right);
+    }
+
+    function assertEq(address left, address right) internal pure {
+        if (left != right) revert AssertionFailedWithValues(uint256(uint160(left)), uint256(uint160(right)));
+    }
+
+    function assertEq(bytes32 left, bytes32 right) internal pure {
+        if (left != right) revert AssertionFailedWithValues(uint256(left), uint256(right));
+    }
+
+    function assertEq(bool left, bool right) internal pure {
+        if (left != right) revert AssertionFailed();
+    }
+
+    function assertGe(uint256 left, uint256 right) internal pure {
+        if (left < right) revert AssertionFailedWithValues(left, right);
+    }
+
+    function assertLe(uint256 left, uint256 right) internal pure {
+        if (left > right) revert AssertionFailedWithValues(left, right);
+    }
+}

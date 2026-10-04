@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { GuardOps } from "./GuardOps.sol";
+import { IGuardView, IOwnerRegistryView, IMigrationHubView } from "./GuardInterfaces.sol";
+
+/* =========================================================================
+   SmartWalletGuard v6.1.0 — Migration Hub
+   =========================================================================
+   ЕДИНСТВЕННЫЙ ИСТОЧНИК ИСТИНЫ по состоянию миграции (ТЗ v6.1 §28-§34).
+
+   Guard больше не хранит `migratedOut` / `migrationAccepted` / `migratedTo` и
+   не имеет `markMigratedOut` / `acceptMigrationIn`. Вместо этого Guard
+   спрашивает Hub:
+
+     migrationStateOf(guard)          состояние миграции
+     finalizedOut(guard)              Guard уже мигрировал наружу
+     acceptedFrom(newGuard, oldGuard) новый Guard принял эту миграцию
+     authorizedMigration(newGuard)    можно ли применять снапшот
+
+   Guard читает это в модификаторе `notMigrated`, поэтому состояние миграции
+   не может быть подделано ни самим Guard-ом, ни владельцами.
+
+   Применение снапшота выполняет SmartWalletGuardMigrationModule: Hub только
+   ведёт состояние, таймлок и отмены, а затем вызывает `applySnapshot`.
+   Adapter policies не мигрируют — адаптеров в v6.1 нет (§34).
+   ========================================================================= */
+
+interface IMigrationTargetModule {
+    function applySnapshot(address oldGuard, bytes32 migrationDataHash, bytes calldata migrationData) external;
+}
+
+contract SmartWalletMigrationHub {
+
+    string public constant VERSION = "6.1.0";
+
+    enum MigrationState { NONE, PROPOSED, READY, FINALIZED, CANCELLED }
+
+    uint256 public constant MIGRATION_DELAY = 48 hours;
+    uint256 public constant MAX_MIGRATION_CANCELS = 3;
+
+    struct Migration {
+        address oldGuard;
+        address newGuard;
+        bytes32 migrationDataHash;
+        uint256 proposedAt;
+        uint256 executableAt;
+        MigrationState state;
+        bool emergency;
+    }
+
+    address public immutable mainWallet;
+    address public immutable permit2;
+    bytes32 public immutable DOMAIN_SEPARATOR;
+
+    /// @notice Hub, обслуживающий конкретный Guard (может быть только один).
+    mapping(address => address) public guardHub;
+    mapping(address => uint256) public currentMigrationId;
+    mapping(uint256 => Migration) public migrations;
+    mapping(uint256 => bool) private _applied;
+
+    /// @notice mainWallet + newGuard => количество отмен (§39).
+    mapping(address => mapping(address => uint256)) public migrationCancelCount;
+
+    /// @notice newGuard => oldGuard, от которого принята финализированная миграция.
+    mapping(address => address) public acceptedFrom;
+    mapping(address => bool) public finalizedOut;
+
+    uint256 public totalMigrations;
+    bool public locked;
+
+    event MigrationProposed(
+        uint256 indexed migrationId, address indexed oldGuard, address indexed newGuard,
+        bytes32 migrationDataHash, uint256 executableAt, bool emergency
+    );
+    event MigrationCancelled(uint256 indexed migrationId, address indexed oldGuard, address indexed newGuard, uint256 cancelCount);
+    event MigrationFinalized(uint256 indexed migrationId, address indexed oldGuard, address indexed newGuard);
+    event MigrationStateChanged(uint256 indexed migrationId, MigrationState state);
+    event GuardHubUpdated(address indexed guard, address indexed hub);
+
+    error NotAuthorized();
+    error BadGuard();
+    error BadNewGuard();
+    error NoMigration();
+    error WrongState();
+    error TimelockActive();
+    error DeadlineExpired();
+    error HashMismatch();
+    error MaxCancelsReached();
+    error CancelsNotReached();
+    error EmergencyKeyNotSet();
+    error InvalidEmergencySignature();
+    error ZeroAddress();
+    error NotContract();
+    error Reentrant();
+
+    constructor(address mainWallet_, address permit2_) {
+        if (mainWallet_ == address(0)) revert ZeroAddress();
+        if (permit2_ == address(0) || permit2_.code.length == 0) revert NotContract();
+        mainWallet = mainWallet_;
+        permit2 = permit2_;
+        DOMAIN_SEPARATOR = GuardOps.domainSeparator(block.chainid, address(this));
+    }
+
+    modifier nonReentrant() {
+        if (locked) revert Reentrant();
+        locked = true;
+        _;
+        locked = false;
+    }
+
+    // =========================================================================
+    // Состояние — то, что читает Guard
+    // =========================================================================
+
+    function migrationStateOf(address guard_) external view returns (uint8) {
+        uint256 id = currentMigrationId[guard_];
+        if (id == 0) return uint8(MigrationState.NONE);
+        Migration memory m = migrations[id];
+        if (m.state == MigrationState.PROPOSED && block.timestamp >= m.executableAt) {
+            return uint8(MigrationState.READY);
+        }
+        return uint8(m.state);
+    }
+
+    function isFinalizedOut(address guard_) external view returns (bool) { return finalizedOut[guard_]; }
+
+    /// @notice Проверка привязки: Guard ссылается на этот Hub.
+    function isBoundTo(address guard_) external view returns (bool) {
+        if (guard_ == address(0) || guard_.code.length == 0) return false;
+        return IGuardView(guard_).migrationHub() == address(this);
+    }
+
+    function authorizedMigration(address newGuard) external view returns (bool) {
+        if (acceptedFrom[newGuard] == address(0)) return false;
+        uint256 id = currentMigrationId[newGuard];
+        return id != 0 && migrations[id].state == MigrationState.FINALIZED;
+    }
+
+    /// @notice Взаимная привязка Hub-а и Guard-а. Достаточно, чтобы Guard уже
+    ///         ссылался на этот Hub (`migrationHub()`), тогда вызов может
+    ///         сделать кто угодно — состояние от этого не меняется, кроме
+    ///         фиксации уже существующей связи.
+    function bindGuard(address guard_) external {
+        if (guard_ == address(0) || guard_.code.length == 0) revert NotContract();
+        if (IGuardView(guard_).migrationHub() != address(this)) revert NotAuthorized();
+        if (guardHub[guard_] != address(0)) return;
+        guardHub[guard_] = address(this);
+        emit GuardHubUpdated(guard_, address(this));
+    }
+
+    // =========================================================================
+    // Предложение миграции — 3/5 + Cold
+    // =========================================================================
+
+    /// @param oldGuard Guard, который мигрирует наружу
+    /// @param newGuard целевой Guard (`expectedOldGuard` уже выставлен)
+    function proposeMigration(
+        address oldGuard,
+        address newGuard,
+        bytes32 migrationDataHash,
+        uint256 nonce,
+        uint256 deadline,
+        bytes[] calldata signatures
+    ) external returns (uint256 migrationId) {
+        _checkOld(oldGuard);
+        _checkNew(oldGuard, newGuard);
+        if (migrationCancelCount[mainWallet][newGuard] >= MAX_MIGRATION_CANCELS) revert MaxCancelsReached();
+
+        uint256 executableAt = block.timestamp + MIGRATION_DELAY;
+        bytes32 dgst = _proposalDigest(oldGuard, newGuard, migrationDataHash, nonce, executableAt, deadline, false);
+        _consumeCritical(oldGuard, dgst, nonce, deadline, signatures);
+        migrationId = _create(oldGuard, newGuard, migrationDataHash, executableAt, false);
+    }
+
+    /// @notice Emergency-путь доступен только после MAX_MIGRATION_CANCELS отмен
+    ///         на этот же newGuard (§39/§40) и требует подписи
+    ///         migrationEmergencyKey + 3/5 с Cold.
+    /// @dev `executeAfter` входит в digest как фиксированное значение и НЕ
+    ///      берётся из `block.timestamp` после подписи, иначе подпись была бы
+    ///      валидна ровно один блок (дефект v5.2.1/v6.0.0).
+    function proposeMigrationWithEmergency(
+        address oldGuard,
+        address newGuard,
+        bytes32 migrationDataHash,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata emergencySignature,
+        bytes[] calldata signatures
+    ) external returns (uint256 migrationId) {
+        _checkOld(oldGuard);
+        _checkNew(oldGuard, newGuard);
+        if (migrationCancelCount[mainWallet][newGuard] < MAX_MIGRATION_CANCELS) revert CancelsNotReached();
+
+        address key = IGuardView(oldGuard).migrationEmergencyKey();
+        if (key == address(0)) revert EmergencyKeyNotSet();
+
+        uint256 executableAt = block.timestamp;
+        bytes32 dgst = _proposalDigest(oldGuard, newGuard, migrationDataHash, nonce, executableAt, deadline, true);
+        if (GuardOps.recover(dgst, emergencySignature) != key) revert InvalidEmergencySignature();
+        _consumeCritical(oldGuard, dgst, nonce, deadline, signatures);
+
+        migrationId = _create(oldGuard, newGuard, migrationDataHash, executableAt, true);
+    }
+
+    function cancelMigration(uint256 migrationId, uint256 nonce, uint256 deadline, bytes[] calldata signatures)
+        external
+    {
+        Migration storage m = migrations[migrationId];
+        if (m.oldGuard == address(0)) revert NoMigration();
+        if (m.state != MigrationState.PROPOSED) revert WrongState();
+        if (block.timestamp >= m.executableAt) revert TimelockActive();
+
+        bytes32 dgst = GuardOps.digestOf(
+            DOMAIN_SEPARATOR,
+            GuardOps.cancelMigrationHash(mainWallet, m.newGuard, nonce, deadline)
+        );
+        _consumeCritical(m.oldGuard, dgst, nonce, deadline, signatures);
+
+        uint256 newCount = migrationCancelCount[mainWallet][m.newGuard] + 1;
+        migrationCancelCount[mainWallet][m.newGuard] = newCount;
+        m.state = MigrationState.CANCELLED;
+        emit MigrationCancelled(migrationId, m.oldGuard, m.newGuard, newCount);
+        emit MigrationStateChanged(migrationId, MigrationState.CANCELLED);
+    }
+
+    // =========================================================================
+    // Финализация
+    // =========================================================================
+
+    /// @notice Финализирует миграцию и применяет снапшот на новом Guard-е через
+    ///         его migration module. Атомарно: при revert состояние не
+    ///         фиксируется (ТЗ §75 v5.1.4).
+    function finalizeMigration(uint256 migrationId, bytes calldata migrationData) external nonReentrant {
+        Migration storage m = migrations[migrationId];
+        if (m.oldGuard == address(0)) revert NoMigration();
+        if (m.state != MigrationState.PROPOSED && m.state != MigrationState.READY) revert WrongState();
+        if (block.timestamp < m.executableAt) revert TimelockActive();
+        if (keccak256(migrationData) != m.migrationDataHash) revert HashMismatch();
+        if (_applied[migrationId]) revert WrongState();
+
+        address oldGuard = m.oldGuard;
+        address newGuard = m.newGuard;
+
+        // Порядок важен: сначала фиксируем состояние, потому что модуль
+        // проверяет `authorizedMigration(newGuard)` и `acceptedFrom`.
+        m.state = MigrationState.FINALIZED;
+        finalizedOut[oldGuard] = true;
+        acceptedFrom[newGuard] = oldGuard;
+        currentMigrationId[newGuard] = migrationId;
+        _applied[migrationId] = true;
+        emit MigrationStateChanged(migrationId, MigrationState.FINALIZED);
+
+        address module = IGuardView(newGuard).migrationModule();
+        if (module == address(0) || module.code.length == 0) revert NotContract();
+        IMigrationTargetModule(module).applySnapshot(oldGuard, m.migrationDataHash, migrationData);
+
+        emit MigrationFinalized(migrationId, oldGuard, newGuard);
+    }
+
+    // =========================================================================
+    // Внутреннее
+    // =========================================================================
+
+    function _checkOld(address oldGuard) internal view {
+        if (oldGuard == address(0) || oldGuard.code.length == 0) revert BadGuard();
+        if (IGuardView(oldGuard).mainWallet() != mainWallet) revert NotAuthorized();
+        if (IGuardView(oldGuard).permit2() != permit2) revert NotAuthorized();
+        if (finalizedOut[oldGuard]) revert WrongState();
+        if (guardHub[oldGuard] != address(this)) revert NotAuthorized();
+        uint256 id = currentMigrationId[oldGuard];
+        if (id != 0) {
+            MigrationState s = migrations[id].state;
+            if (s == MigrationState.PROPOSED || s == MigrationState.READY) revert WrongState();
+        }
+    }
+
+    function _checkNew(address oldGuard, address newGuard) internal view {
+        if (newGuard == address(0) || newGuard.code.length == 0) revert BadNewGuard();
+        if (newGuard == oldGuard) revert BadNewGuard();
+        if (IGuardView(newGuard).mainWallet() != mainWallet) revert NotAuthorized();
+        if (IGuardView(newGuard).permit2() != permit2) revert NotAuthorized();
+        if (IGuardView(newGuard).expectedOldGuard() != oldGuard) revert BadNewGuard();
+        if (acceptedFrom[newGuard] != address(0)) revert WrongState();
+        if (guardHub[newGuard] != address(0) && guardHub[newGuard] != address(this)) revert BadNewGuard();
+    }
+
+    function _create(
+        address oldGuard, address newGuard, bytes32 migrationDataHash, uint256 executableAt, bool emergency
+    ) internal returns (uint256 id) {
+        id = ++totalMigrations;
+        migrations[id] = Migration(
+            oldGuard, newGuard, migrationDataHash, block.timestamp, executableAt, MigrationState.PROPOSED, emergency
+        );
+        currentMigrationId[oldGuard] = id;
+        guardHub[newGuard] = address(this);
+        emit MigrationProposed(id, oldGuard, newGuard, migrationDataHash, executableAt, emergency);
+    }
+
+    function _proposalDigest(
+        address oldGuard, address newGuard, bytes32 migrationDataHash,
+        uint256 nonce, uint256 executableAt, uint256 deadline, bool emergency
+    ) internal view returns (bytes32) {
+        return GuardOps.digestOf(
+            DOMAIN_SEPARATOR,
+            GuardOps.migrationHash(mainWallet, newGuard, migrationDataHash, nonce, executableAt, deadline, emergency)
+        );
+    }
+
+    function _consumeCritical(
+        address guard_, bytes32 dgst, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) internal {
+        if (block.timestamp > deadline) revert DeadlineExpired();
+        IOwnerRegistryView(IGuardView(guard_).ownerRegistry()).requireSignatures(dgst, signatures, true);
+        if (!IGuardView(guard_).consumeGovernanceNonce(nonce)) revert NotAuthorized();
+    }
+}

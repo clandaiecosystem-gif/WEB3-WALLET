@@ -1,0 +1,38 @@
+// solc driver: runs soljson in the global context (so its top-level `var Module`
+// resolves against globalThis), then compiles the passed standard-JSON input.
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const soljsonPath = path.resolve(process.argv[2]);
+const inputPath = path.resolve(process.argv[3]);
+const outputPath = path.resolve(process.argv[4]);
+
+const code = fs.readFileSync(soljsonPath, 'utf8');
+
+// Emscripten's node detection needs these in the global scope.
+globalThis.__dirname = path.dirname(soljsonPath);
+globalThis.__filename = soljsonPath;
+globalThis.require = require;
+
+globalThis.Module = {
+  print: () => {},
+  printErr: () => {},
+  onRuntimeInitialized() {
+    try {
+      const compile = globalThis.Module.cwrap('solidity_compile', 'string', ['string', 'number']);
+      const out = compile(fs.readFileSync(inputPath, 'utf8'), 0);
+      fs.writeFileSync(outputPath, out);
+    } catch (e) {
+      fs.writeFileSync(outputPath + '.err', String((e && e.stack) || e));
+      process.exitCode = 1;
+    }
+  },
+};
+
+try {
+  vm.runInThisContext(code, { filename: soljsonPath });
+} catch (e) {
+  fs.writeFileSync(outputPath + '.err', 'LOAD: ' + String((e && e.stack) || e));
+  process.exitCode = 1;
+}

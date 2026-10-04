@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+/* =========================================================================
+   SmartWalletGuard v6.1.0 — общие интерфейсы
+   =========================================================================
+   Отдельный файл без реализаций: его импортируют Guard, OwnerRegistry,
+   PolicyRegistry, SubscriptionManager и MigrationHub, не втягивая
+   creation-код друг друга.
+
+   Отличия от v6.0.0: интерфейса адаптеров (`ISwapAdapterView`) больше нет,
+   whitelist-интерфейс заменён на contract-level policy + token risk.
+   ========================================================================= */
+
+interface IERC20View {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IPermit2View {
+    function transferFrom(address from, address to, uint160 amount, address token) external;
+    function allowance(address owner, address token, address spender)
+        external view returns (uint160 amount, uint48 expiration, uint48 nonce);
+}
+
+interface ISmartWalletView {
+    function guard() external view returns (address);
+    function permit2() external view returns (address);
+    function paused() external view returns (bool);
+    function sendNativeByGuard(address payable to, uint256 amount) external;
+    function proposeGuardMigration(address newGuard) external;
+    function acceptGuardMigration() external;
+    function emergencyEnablePermit2ForGuard(address token) external;
+    function revokePermit2ForGuard(address token) external;
+}
+
+interface IOwnerRegistryView {
+    function guard() external view returns (address);
+    function permit2() external view returns (address);
+    function setGuard(address guard_) external;
+    function initialize(address[] calldata owners, bool[] calldata isHot) external;
+    function changeOwners(address[] calldata owners, bool[] calldata isHot) external;
+    function setHub(address hub) external;
+    function addWallet(address wallet, bool isHot) external;
+    function removeWallet(address wallet) external;
+    function consumeNonce(address scope, uint256 nonce) external;
+    function tryConsumeNonce(address scope, uint256 nonce) external returns (bool);
+    function requireSignatures(bytes32 dgst, bytes[] calldata sigs, bool critical) external view;
+    function verifySignatures(bytes32 dgst, bytes[] calldata sigs, bool critical) external view returns (bool);
+
+    function getOwners() external view returns (address[] memory);
+    function isOwner(address owner) external view returns (bool);
+    function isOwnerHot(address owner) external view returns (bool);
+    function isNonceUsed(address scope, uint256 nonce) external view returns (bool);
+    function isRegisteredWallet(address wallet) external view returns (bool);
+    function isHotWallet(address wallet) external view returns (bool);
+    function isColdWallet(address wallet) external view returns (bool);
+    function getHotWallets() external view returns (address[] memory);
+    function getColdWallets() external view returns (address[] memory);
+}
+
+interface IPolicyRegistryView {
+    function guard() external view returns (address);
+    function isBoundTo(address guard_) external view returns (bool);
+    function setHub(address hub) external;
+    function claim(address expectedMainWallet, address expectedPermit2) external;
+
+    function blacklist(address target) external view returns (bool);
+    function approvedToken(address token) external view returns (bool);
+    function approvedRouter(address router) external view returns (bool);
+    function tradingPlatform(address platform) external view returns (bool);
+    function defaultTransferShareBps() external view returns (uint256);
+    function setDefaultTransferShareBps(uint256 bps) external;
+
+    function getContractPolicy(address targetContract)
+        external view returns (bool exists, bool blocked, uint256 usdLimit, uint256 usdSpent, uint256 maxTokenShareBps, uint256 deadline);
+    function getTokenRisk(address token) external view returns (bool configured, uint8 category);
+    function effectiveTokenRisk(address token) external view returns (uint8);
+    function getTokenPrice(address token) external view returns (bool configured, uint256 priceE18, uint8 decimals);
+    function getTokenAmountPolicy(address targetContract, address token)
+        external view returns (bool exists, uint256 maxAmount, uint256 maxBalanceShareBps);
+    function getRecoveryTarget(address wallet, address token)
+        external view returns (bool exists, address recipient);
+    function remainingUsd(address targetContract) external view returns (uint256);
+    function maxSpendableAmount(address wallet, address targetContract, address token)
+        external view returns (uint256 byBalance);
+
+    function getContractPolicyKeys() external view returns (address[] memory);
+    function getTokenRiskKeys() external view returns (address[] memory);
+    function getTokenPriceKeys() external view returns (address[] memory);
+    function getBlacklist() external view returns (address[] memory);
+    function getApprovedTokens() external view returns (address[] memory);
+    function getApprovedRouters() external view returns (address[] memory);
+    function getTradingPlatforms() external view returns (address[] memory);
+    function getRecoveryKeys() external view returns (address[] memory);
+
+    function checkAndSpend(
+        address wallet, address target, address token, uint256 amount, bool strictExternal
+    ) external returns (uint256 usdValue);
+    function consumeStrict(address target, address token, uint256 amount) external;
+    function checkTransferShare(address wallet, address token, uint256 amount, uint256 shareBps)
+        external view returns (bool);
+    function checkApproval(
+        address wallet, address spender, address token, uint256 amount,
+        uint256 usdLimit, uint256 maxTokenShareBps
+    ) external view returns (bool);
+
+    function setContractPolicy(
+        address targetContract, bool blocked, uint256 usdLimit, uint256 maxTokenShareBps, uint256 deadline
+    ) external;
+    function setContractBlocked(address targetContract, bool blocked) external;
+    function setContractDeadline(address targetContract, uint256 deadline) external;
+    function increaseContractUsdLimit(address targetContract, uint256 newUsdLimit) external;
+    function removeContractPolicy(address targetContract) external;
+    function setTokenRisk(address token, uint8 category) external;
+    function clearTokenRisk(address token) external;
+    function setTokenPrice(address token, uint256 priceE18, uint8 decimals) external;
+    function clearTokenPrice(address token) external;
+    function setTokenAmountPolicy(
+        address targetContract, address token, uint256 maxAmount, uint256 maxBalanceShareBps
+    ) external;
+    function removeTokenAmountPolicy(address targetContract, address token) external;
+
+    function addBlacklist(address target) external;
+    function removeBlacklist(address target) external;
+    function addToken(address token) external;
+    function removeToken(address token) external;
+    function addRouter(address router) external;
+    function removeRouter(address router) external;
+    function addTradingPlatform(address platform) external;
+    function removeTradingPlatform(address platform) external;
+    function setRecoveryTarget(address wallet, address token, address recipient) external;
+    function removeRecoveryTarget(address wallet, address token) external;
+}
+
+interface ISubscriptionsView {
+    function guard() external view returns (address);
+    function isBoundTo(address guard_) external view returns (bool);
+    function setHub(address hub) external;
+    function mainWallet() external view returns (address);
+    function permit2() external view returns (address);
+
+    function activePlan() external view returns (uint8);
+    function activePlanAndMask() external view returns (uint8 plan, uint256 mask);
+    function permissionMask() external view returns (uint256);
+    function planMaskOf(uint8 plan) external view returns (uint256);
+    function appVersionHash() external view returns (bytes32);
+    function treasury() external view returns (address);
+    function getSubscription() external view returns (uint8 plan, uint64 expiresAt);
+    function getPlanConfig(uint8 plan)
+        external view returns (address paymentToken, uint256 price, uint64 period, bool enabled);
+
+    function subscribe(
+        uint8 plan, address fromWallet, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external;
+    function setRecoveryTarget(address wallet, address token, address recipient) external;
+    function removeRecoveryTarget(address wallet, address token) external;
+    function claimSubscription(uint8 plan, uint64 expiresAt) external;
+
+    /// @dev Параллельные массивы: подпись совпадает у Guard-а и Manager-а без
+    ///      общих типов структур.
+    function claimConfiguration(
+        address treasury_,
+        bytes32 appVersionHash_,
+        address p2pAdmin_,
+        address p2pDAO_,
+        uint64 p2pTimeout_,
+        uint8[] calldata plans,
+        address[] calldata tokens,
+        uint256[] calldata prices,
+        uint64[] calldata periods,
+        bool[] calldata enabled
+    ) external;
+    function claimPolicy(uint8 kind, address a, address b, uint256 limit, uint256 deadline, address recipient) external;
+}
+
+/* =========================================================================
+   MigrationHub — единственный источник истины по состоянию миграции
+   ========================================================================= */
+
+interface IMigrationHubView {
+    function isBoundTo(address guard_) external view returns (bool);
+    function bindGuard(address guard_) external;
+
+    function migrationStateOf(address guard_) external view returns (uint8);
+    function finalizedOut(address guard_) external view returns (bool);
+    function acceptedFrom(address newGuard, address oldGuard) external view returns (bool);
+    function authorizedMigration(address newGuard) external view returns (bool);
+    function currentMigrationId(address guard_) external view returns (uint256);
+    function migrationCancelCount(address mainWallet, address newGuard) external view returns (uint256);
+
+    function proposeMigration(
+        address oldGuard, address newGuard, bytes32 migrationDataHash,
+        uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external returns (uint256 migrationId);
+    function cancelMigration(uint256 migrationId, uint256 nonce, uint256 deadline, bytes[] calldata signatures) external;
+    function proposeMigrationWithEmergency(
+        address oldGuard, address newGuard, bytes32 migrationDataHash,
+        uint256 nonce, uint256 deadline, bytes calldata emergencySignature, bytes[] calldata signatures
+    ) external returns (uint256 migrationId);
+    function finalizeMigration(uint256 migrationId, bytes calldata migrationData) external;
+}
+
+interface IGuardView {
+    function mainWallet() external view returns (address);
+    function permit2() external view returns (address);
+    function expectedOldGuard() external view returns (address);
+    function domainSeparator() external view returns (bytes32);
+    function ownerRegistry() external view returns (address);
+    function policyRegistry() external view returns (address);
+    function subscriptions() external view returns (address);
+    function migrationHub() external view returns (address);
+    function migrationModule() external view returns (address);
+    function migrationState() external view returns (uint8);
+    function initialized() external view returns (bool);
+    function migrationEmergencyKey() external view returns (address);
+    function strictKey() external view returns (address);
+    function isRegisteredWallet(address wallet) external view returns (bool);
+
+    function setHub(address hub) external;
+    function configureModules(address policyRegistry_, address subscriptions_, address migrationHub_) external;
+    function initializeOwners(address[] calldata owners_, bool[] calldata isHot_) external;
+    function claimOwners(address[] calldata newOwners, bool[] calldata newIsHot) external;
+    function claimWallet(address wallet, bool isHot) external;
+    function claimSubscription(uint8 plan, uint64 expiresAt) external;
+    function claimConfiguration(
+        address treasury_,
+        bytes32 appVersionHash_,
+        address p2pAdmin_,
+        address p2pDAO_,
+        uint64 p2pTimeout_,
+        uint8[] calldata plans,
+        address[] calldata tokens,
+        uint256[] calldata prices,
+        uint64[] calldata periods,
+        bool[] calldata enabled
+    ) external;
+    function claimPolicy(uint8 kind, address a, address b, uint256 limit, uint256 deadline, address recipient) external;
+    function claimMigrationEmergencyKey(address key) external;
+    function claimStrictKey(address key) external;
+    function markInitialized() external;
+    function consumeGovernanceNonce(uint256 nonce) external returns (bool);
+    function proposeWalletGuardMigration(address wallet, address newGuard) external;
+    function acceptWalletGuardMigration(address wallet) external;
+    function enablePermit2OnWallet(address wallet, address token) external;
+    function revokePermit2OnWallet(
+        address wallet, address token, uint256 nonce, uint256 deadline, bytes[] calldata signatures
+    ) external;
+}

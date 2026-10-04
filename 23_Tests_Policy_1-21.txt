@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { GuardFixture } from "./GuardFixture.sol";
+import { SmartWalletPolicyRegistry } from "../contracts/SmartWalletPolicyRegistry-v6.1.0.sol";
+import { MockERC20, MockWallet } from "./Mocks.sol";
+
+/* =========================================================================
+   SmartWalletGuard v6.1.0 — обязательные тесты (ТЗ v6.1 §56)
+   ========================================================================= */
+
+contract GuardPolicyTest is GuardFixture {
+
+    // =========================================================================
+    // Whitelist / Contract policy (1-4)
+    // =========================================================================
+
+    function test_1_WhitelistContractWorks() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        uint256 before = _balanceOf(address(usd), address(dex));
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 10 * 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 10 * 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+        assertEq(_balanceOf(address(usd), address(dex)) - before, 10 * 1e6);
+    }
+
+    function test_2_UnknownContractBlocked() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        MockERC20 stranger = new MockERC20();
+
+        vm.expectRevert(SmartWalletPolicyRegistry.ContractNotWhitelisted.selector);
+        guard.executeOnContract(
+            address(wallet), address(stranger), address(usd), 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(stranger), address(usd), 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_3_BlockedContractRejected() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), true, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.ContractBlocked.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_4_ExpiredContractRejected() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + 1 days);
+        vm.warp(block.timestamp + 2 days);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.PolicyExpired.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    // =========================================================================
+    // GREEN (5-7)
+    // =========================================================================
+
+    function test_5_GreenTokenWithinUsdLimitWorks() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        // $50 при цене $1 -> 50e6 токена (6 decimals)
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 50 * 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 50 * 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+        (bool exists, , uint256 limit, uint256 spent, , ) = policy.getContractPolicy(address(dex));
+        assertTrue(exists);
+        assertEq(limit, HUNDRED);
+        assertEq(spent, 50 * DOLLAR);
+        assertEq(policy.remainingUsd(address(dex)), 50 * DOLLAR);
+    }
+
+    function test_6_GreenTokenAboveUsdLimitReverts() public {
+        _grantStandard();
+        _fund(address(usd), 10_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        // $150 > $100
+        vm.expectRevert(SmartWalletPolicyRegistry.UsdLimitExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 150 * 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 150 * 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_7_GreenTokenAboveBalanceShareReverts() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        // share 5% -> максимум 50e6; лимит $1000 не мешает
+        _setContractPolicy(address(dex), false, 1_000 * DOLLAR, 500, block.timestamp + WEEK);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.BalanceShareExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 51 * 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 51 * 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    // =========================================================================
+    // YELLOW (8-10)
+    // =========================================================================
+
+    function test_8_YellowTokenUsesAmountLimit() public {
+        _grantStandard();
+        _fund(address(mid), 1_000 ether);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+        _setAmountPolicy(address(dex), address(mid), 100 ether, 10_000);
+
+        guard.executeOnContract(
+            address(wallet), address(dex), address(mid), 100 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(mid), 100 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+        assertEq(_balanceOf(address(mid), address(dex)), 100 ether);
+    }
+
+    function test_9_YellowTokenAboveAmountReverts() public {
+        _grantStandard();
+        _fund(address(mid), 1_000 ether);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+        _setAmountPolicy(address(dex), address(mid), 100 ether, 10_000);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.LimitExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(mid), 101 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(mid), 101 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_10_YellowTokenAboveBalanceShareReverts() public {
+        _grantStandard();
+        _fund(address(mid), 1_000 ether);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+        // amount-лимит большой, доля баланса 5% -> максимум 50 ether
+        _setAmountPolicy(address(dex), address(mid), 1_000 ether, 500);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.BalanceShareExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(mid), 51 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(mid), 51 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    // =========================================================================
+    // RED (11-14)
+    // =========================================================================
+
+    function test_11_RedTokenUsesAmountLimit() public {
+        _grantStandard();
+        _fund(address(meme), 1_000 ether);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+        _setAmountPolicy(address(dex), address(meme), 500 ether, 10_000);
+
+        guard.executeOnContract(
+            address(wallet), address(dex), address(meme), 500 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(meme), 500 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+        assertEq(_balanceOf(address(meme), address(dex)), 500 ether);
+    }
+
+    function test_12_RedTokenAboveAmountReverts() public {
+        _grantStandard();
+        _fund(address(meme), 1_000 ether);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+        _setAmountPolicy(address(dex), address(meme), 500 ether, 10_000);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.LimitExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(meme), 501 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(meme), 501 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_13_RedTokenAboveBalanceShareReverts() public {
+        _grantStandard();
+        _fund(address(meme), 1_000 ether);
+        _setContractPolicy(address(dex), false, 0, 10_000, block.timestamp + WEEK);
+        _setAmountPolicy(address(dex), address(meme), 1_000 ether, 500);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.BalanceShareExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(meme), 51 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(meme), 51 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_14_UnknownTokenDefaultsToStrict() public {
+        _grantStandard();
+        MockERC20 unknown = new MockERC20();
+        _asGuardPolicyAddToken(address(unknown));
+        _fund(address(unknown), 1_000 ether);
+        _setContractPolicy(address(dex), false, 1_000 * DOLLAR, 10_000, block.timestamp + WEEK);
+
+        // Неизвестный токен не получает USD-режим: категория RED по умолчанию,
+        // token amount policy отсутствует -> операция отклоняется.
+        assertEq(uint256(policy.effectiveTokenRisk(address(unknown))), uint256(SmartWalletPolicyRegistry.TokenRiskCategory.RED));
+
+        vm.expectRevert(SmartWalletPolicyRegistry.LimitExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(unknown), 1 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(unknown), 1 ether, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    // =========================================================================
+    // Supply attack (15-17)
+    // =========================================================================
+
+    function test_15_CheapTokenCannotDrainWholeBalance() public {
+        _grantStandard();
+        // Цена $0.000001, баланс 1e9 токенов: $1000 покрывает весь баланс
+        MockERC20 cheap = new MockERC20();
+        _asGuardPolicyAddToken(address(cheap));
+        _setRisk(address(cheap), SmartWalletPolicyRegistry.TokenRiskCategory.GREEN);
+        _setPrice(address(cheap), 1e12, 18); // $0.000001 в 1e18-шкале
+        _fund(address(cheap), 1_000_000_000 ether);
+        // доля баланса 5% => максимум 50e6 токенов
+        _setContractPolicy(address(dex), false, 1_000 * DOLLAR, 500, block.timestamp + WEEK);
+
+        vm.expectRevert(SmartWalletPolicyRegistry.BalanceShareExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(cheap), 1_000_000_000 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(cheap), 1_000_000_000 ether, address(wallet),
+                false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_16_CheapTokenCannotBypassUsdLimit() public {
+        _grantStandard();
+        MockERC20 cheap = new MockERC20();
+        _asGuardPolicyAddToken(address(cheap));
+        _setRisk(address(cheap), SmartWalletPolicyRegistry.TokenRiskCategory.GREEN);
+        _setPrice(address(cheap), 1e12, 18); // $0.000001
+        _fund(address(cheap), 1_000_000_000 ether);
+        _setContractPolicy(address(dex), false, 10 * DOLLAR, 10_000, block.timestamp + WEEK);
+
+        // 20e6 токенов * $0.000001 = $20 > $10
+        vm.expectRevert(SmartWalletPolicyRegistry.UsdLimitExceeded.selector);
+        guard.executeOnContract(
+            address(wallet), address(dex), address(cheap), 20_000_000 ether, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(cheap), 20_000_000 ether, address(wallet),
+                false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_17_MultipleApprovalsCannotBypassPolicy() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        // Первый approve на $60 проходит
+        bytes32 d1 = _approveDigest(address(wallet), address(dex), address(usd), 60 * 1e6, false, 10, type(uint256).max);
+        guard.approveOnContract(
+            address(wallet), address(dex), address(usd), 60 * 1e6, false, 10, type(uint256).max, "", _twoHot(d1)
+        );
+
+        // Второй approve на $60 должен быть отклонён: usdSpent уже 60
+        bytes32 d2 = _approveDigest(address(wallet), address(dex), address(usd), 60 * 1e6, false, 11, type(uint256).max);
+        vm.expectRevert(SmartWalletPolicyRegistry.UsdLimitExceeded.selector);
+        guard.approveOnContract(
+            address(wallet), address(dex), address(usd), 60 * 1e6, false, 11, type(uint256).max, "", _twoHot(d2)
+        );
+    }
+
+    // =========================================================================
+    // Approval (18-21)
+    // =========================================================================
+
+    function test_18_UnlimitedApproveRejected() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        bytes32 d = _approveDigest(
+            address(wallet), address(dex), address(usd), type(uint256).max, false, 10, type(uint256).max
+        );
+        vm.expectRevert(SmartWalletPolicyRegistry.UnlimitedApprove.selector);
+        guard.approveOnContract(
+            address(wallet), address(dex), address(usd), type(uint256).max, false, 10, type(uint256).max, "", _twoHot(d)
+        );
+    }
+
+    function test_19_ExactApproveAllowed() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+
+        bytes32 d = _approveDigest(address(wallet), address(dex), address(usd), 15 * 1e6, false, 10, type(uint256).max);
+        guard.approveOnContract(
+            address(wallet), address(dex), address(usd), 15 * 1e6, false, 10, type(uint256).max, "", _twoHot(d)
+        );
+        (, , uint256 limit, uint256 spent, , ) = policy.getContractPolicy(address(dex));
+        assertEq(limit, HUNDRED);
+        assertEq(spent, 15 * DOLLAR);
+    }
+
+    function test_20_ExpiredPermit2Rejected() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+        // Просроченный allowance
+        permit2.setAllowance(address(wallet), address(usd), address(guard), type(uint160).max, uint48(block.timestamp + 10));
+        vm.warp(block.timestamp + 100);
+
+        vm.expectRevert();
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+
+    function test_21_ZeroPermit2ExpirationRejected() public {
+        _grantStandard();
+        _fund(address(usd), 1_000 * 1e6);
+        _setContractPolicy(address(dex), false, HUNDRED, 10_000, block.timestamp + WEEK);
+        permit2.setAllowance(address(wallet), address(usd), address(guard), type(uint160).max, 0);
+        vm.warp(block.timestamp + 1);
+
+        vm.expectRevert();
+        guard.executeOnContract(
+            address(wallet), address(dex), address(usd), 1e6, address(wallet),
+            false, 10, type(uint256).max, "", _twoHot(_onContractDigest(
+                address(wallet), address(dex), address(usd), 1e6, address(wallet), false, 10, type(uint256).max
+            ))
+        );
+    }
+}

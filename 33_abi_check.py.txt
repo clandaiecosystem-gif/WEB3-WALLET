@@ -1,0 +1,68 @@
+"""Cross-check that every interface call made by a contract exists in the
+target contract's compiled ABI. Guards against signature drift between
+modules after refactoring."""
+import json
+import os
+import re
+import sys
+
+W = r"C:\Users\Виталя\Documents\deepseek-harness\default-workspace"
+BUILD = os.path.join(W, "build")
+CONTRACTS = os.path.join(W, "contracts")
+
+
+def load_abi(name):
+    with open(os.path.join(BUILD, name + ".abi.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def abi_index(abi):
+    """selector-name -> (n_inputs, input_types)"""
+    idx = {}
+    for item in abi:
+        if item.get("type") != "function":
+            continue
+        idx[item["name"]] = [i["type"] for i in item.get("inputs", [])]
+    return idx
+
+
+INTERFACE_TARGET = {
+    "GuardOps": None,
+    "ISubscriptionsView": "SmartWalletGuardSubscriptions",
+    "IPolicyRegistryView": "SmartWalletPolicyRegistry",
+    "IOwnerRegistryView": "SmartWalletGuardOwnerRegistry",
+    "ISmartWalletView": None,
+    "IPermit2View": None,
+    "ISwapAdapterView": None,
+    "IERC20View": None,
+    "IGuardView": "SmartWalletGuard",
+}
+
+abis = {
+    "SmartWalletGuard": abi_index(load_abi("SmartWalletGuard")),
+    "SmartWalletGuardSubscriptions": abi_index(load_abi("SmartWalletGuardSubscriptions")),
+    "SmartWalletPolicyRegistry": abi_index(load_abi("SmartWalletPolicyRegistry")),
+    "SmartWalletGuardOwnerRegistry": abi_index(load_abi("SmartWalletGuardOwnerRegistry")),
+}
+
+CALL_RE = re.compile(r"(I\w+View|GuardOps)\([^)]*\)\.(\w+)\(")
+problems = 0
+checked = 0
+
+for fname in os.listdir(CONTRACTS):
+    if not fname.endswith(".sol"):
+        continue
+    with open(os.path.join(CONTRACTS, fname), encoding="utf-8") as f:
+        src = f.read()
+    for m in CALL_RE.finditer(src):
+        iface, fn = m.group(1), m.group(2)
+        target = INTERFACE_TARGET.get(iface)
+        if target is None:
+            continue
+        checked += 1
+        if fn not in abis[target]:
+            print("MISSING  %-28s -> %s.%s" % (fname, target, fn))
+            problems += 1
+
+print("interface calls checked:", checked, "problems:", problems)
+sys.exit(1 if problems else 0)

@@ -1,0 +1,1647 @@
+# ТЕХНИЧЕСКОЕ ЗАДАНИЕ
+## SmartWalletGuard v5.1.4
+Тип: on-chain security / policy / authorization controller для non-custodial Smart Wallet
+Язык: Solidity ^0.8.20
+Основной стандарт: EVM-compatible networks
+Ключевые зависимости: Uniswap Permit2, SmartHotWallet, SmartColdWallet, adapters
+Цель: безопасно управлять разрешёнными операциями Smart Wallet, не храня пользовательские средства непосредственно в Guard.
+# 1. Архитектура
+Система состоит из:
+SmartWalletGuard
+SmartHotWallet
+SmartColdWallet
+UniswapV2Adapter
+Permit2
+ERC20 токенов
+внешних DEX/router
+backend, который читает on-chain состояние
+subscription / entitlement системы внутри Guard.
+### Главный принцип
+SmartWalletGuard не хранит пользовательские средства.
+Средства находятся только в:
+Hot Wallet;
+Cold Wallet.
+Guard отвечает за:
+авторизацию;
+подписи;
+whitelist;
+blacklist;
+approved tokens;
+approved routers;
+adapters;
+Permit2 policy;
+recovery;
+emergency sweep;
+owner governance;
+migration;
+subscription entitlements;
+P2P/trading/app configuration.
+# 2. Owner architecture
+Всего:
+5 governance owners;
+3 Hot Owners;
+2 Cold Owners.
+Например:
+Hot Owner 1
+Hot Owner 2
+Hot Owner 3
+
+Cold Owner 1
+Cold Owner 2
+## Обычные операции
+Требуют:
+2 / 3 Hot Owners
+При этом Cold Owners не нужны.
+## Critical operations
+Требуют:
+3 / 5 Owners
++
+минимум 1 Cold Owner
+Это применяется к критическим изменениям:
+owner rotation;
+treasury;
+plan configuration;
+P2P configuration;
+emergency migration;
+другим критическим governance операциям.
+# 3. Wallet separation
+Guard должен различать:
+### Governance Cold Owner
+Обычный адрес governance owner.
+### SmartColdWallet
+Отдельный пользовательский Smart Wallet.
+Это разные сущности.
+Нельзя путать:
+cold governance owner
+и
+cold wallet
+# 4. Guard immutable parameters
+Guard должен иметь:
+string public constant VERSION = "5.1.4";
+
+address public immutable mainWallet;
+address public immutable permit2;
+address public immutable expectedOldGuard;
+Также:
+uint256 public constant HOT_THRESHOLD = 2;
+uint256 public constant CRITICAL_THRESHOLD = 3;
+
+uint256 public constant TOTAL_OWNERS = 5;
+uint256 public constant HOT_OWNERS = 3;
+
+uint256 public constant MIGRATION_DELAY = 48 hours;
+uint256 public constant MAX_MIGRATION_CANCELS = 3;
+# 5. Main Wallet
+mainWallet — основной governance/account identity системы.
+Подписки должны храниться относительно:
+subscriptions[mainWallet]
+а не отдельно для каждого Hot/Cold Wallet.
+Таким образом:
+Main Wallet
+   |
+   +-- Hot Wallet #1
+   +-- Hot Wallet #2
+   +-- Cold Wallet #1
+   +-- ...
+имеют одну subscription identity.
+# 6. EIP-712
+Все подписываемые операции должны использовать EIP-712.
+Domain:
+name:
+SmartWalletGuard
+
+version:
+bytes(VERSION)
+
+chainId:
+block.chainid
+
+verifyingContract:
+address(this)
+Каждая операция должна иметь собственный typed hash.
+# 7. Nonce architecture
+Должны использоваться nonce отдельно для:
+### Wallet operations
+hotWallet nonce
+Используется для:
+token transfer;
+native transfer;
+swap;
+emergency sweep;
+subscription.
+### Governance operations
+mainWallet nonce
+Используется для:
+whitelist;
+adapters;
+blacklist;
+token registry;
+router registry;
+owner changes;
+recovery target;
+subscription configuration;
+migration;
+critical configuration.
+Nonce должен быть consumed до выполнения основной операции.
+usedNonces[wallet][nonce]
+Повторное использование nonce запрещено.
+# 8. Signature validation
+Функция проверки подписей должна:
+принимать максимум 5 подписей;
+проверять длину signature = 65;
+нормализовать v;
+проверять v == 27 || v == 28;
+проверять low-s;
+запрещать zero address;
+восстанавливать signer через ECDSA;
+проверять, что signer является текущим owner;
+запрещать duplicate signer;
+проверять необходимый threshold;
+для critical operation проверять наличие минимум одного Cold Owner.
+# 9. Signature thresholds
+## HOT
+2 / 3 Hot Owners
+## CRITICAL
+3 / 5 Owners
++
+1+ Cold Owner
+# 10. Hot Wallet Registry
+Guard хранит:
+mapping(address => bool) public hotWallets;
+Wallet может быть добавлен только если:
+wallet != address(0)
+wallet.code.length > 0
+wallet.guard() == address(this)
+wallet.permit2() == permit2
+После добавления wallet становится допустимым источником обычных операций.
+Удаление Hot Wallet должно требовать:
+2 / 3 Hot
+# 11. Cold Wallet Registry
+Аналогично:
+mapping(address => bool) public coldWallets;
+Cold Wallet:
+является SmartColdWallet;
+должен иметь Guard;
+должен использовать тот же Permit2.
+Удаление:
+2 / 3 Hot
+# 12. Approved Token Registry
+Guard должен иметь:
+mapping(address => bool) public approvedToken;
+Токен может быть добавлен только если:
+address != 0
+code.length > 0
+Добавление:
+2 / 3 Hot
+Удаление:
+2 / 3 Hot
+После удаления токена:
+новые transfers запрещены;
+новые swaps запрещены;
+новые subscriptions через этот token запрещены;
+whitelist execution с этим token запрещается.
+### Важно
+Удаление токена не должно пытаться физически забрать его из Wallet.
+Это policy revoke.
+# 13. Approved Router Registry
+mapping(address => bool) public approvedRouter;
+Router:
+must be contract
+Добавление:
+2 / 3 Hot
+Удаление:
+2 / 3 Hot
+Если router удалён из registry:
+swap через него должен немедленно прекратиться.
+# 14. Blacklist
+Guard должен иметь:
+mapping(address => bool) public blacklist;
+Blacklist применяется минимум к:
+recipient;
+token;
+router;
+adapter;
+recovery recipient.
+При blacklist:
+execution must fail.
+Blacklist должен проверяться не только в момент создания policy, но и непосредственно в момент исполнения.
+Это важно для emergency revoke.
+# 15. Token transfer
+Guard должен поддерживать перевод ERC20 через Permit2.
+Flow:
+Smart Wallet
+      |
+      | ERC20 allowance
+      v
+Permit2
+      |
+      | Guard allowance
+      v
+Guard
+      |
+      v
+Recipient
+Wallet заранее делает:
+ERC20 -> Permit2 = MAX
+Permit2 делает:
+Wallet -> Guard = MAX
+Guard после проверки подписей вызывает:
+Permit2.transferFrom(
+    wallet,
+    recipient,
+    amount,
+    token
+);
+# 16. Transfer restrictions
+Перед transfer обязательно проверить:
+### Wallet
+registered wallet
+wallet.guard() == address(this)
+### Wallet state
+!wallet.paused()
+### Token
+approvedToken[token]
+!blacklist[token]
+### Recipient
+recipient != address(0)
+!blacklist[recipient]
+### Whitelist
+Для recipient/token должна существовать активная policy.
+Проверяется:
+remaining >= amount
+expiresAt >= block.timestamp
+После успешной операции:
+remaining -= amount
+# 17. Amount limit
+Все суммы, передаваемые в Permit2:
+uint160
+Поэтому:
+amount > 0
+amount <= type(uint160).max
+# 18. Native transfers
+Native currency не должна проходить через Permit2.
+Используется:
+wallet.sendNativeByGuard(...)
+Перед операцией:
+registered hot wallet
+wallet not paused
+recipient not blacklisted
+NATIVE whitelist exists
+deadline valid
+nonce unused
+2/3 Hot signatures
+После:
+whitelist remaining -= amount
+# 19. Smart Wallet native primitive
+SmartHotWallet / SmartColdWallet должны иметь узкий primitive:
+sendNativeByGuard(address payable to, uint256 amount)
+Только:
+onlyGuard
+Запрещено давать Guard произвольный:
+execute()
+call()
+delegatecall()
+# 20. Swap architecture
+Swap выполняется через adapter.
+Flow:
+Smart Wallet
+      |
+      | Permit2
+      v
+Adapter
+      |
+      | approve
+      v
+Router
+      |
+      v
+DEX
+Guard не должен напрямую разрешать произвольный router call.
+# 21. Adapter Registry
+Guard хранит:
+mapping(address => AdapterPolicy) public adapters;
+Adapter должен:
+be contract
+not be blacklisted
+guard() == address(this)
+router() approved
+tokenIn approved
+# 22. Adapter policy
+Каждый adapter имеет:
+uint256 remaining;
+uint256 expiresAt;
+Adapter policy означает максимальный объём tokenIn, который adapter может обработать.
+После swap:
+remaining -= amountIn
+# 23. Swap validation
+Guard проверяет:
+wallet registered
+wallet not paused
+
+adapter registered
+adapter not blacklisted
+
+adapter.guard() == this
+
+router approved
+router not blacklisted
+
+tokenIn approved
+tokenOut approved
+
+tokenIn != tokenOut
+
+recipient not blacklisted
+
+deadline valid
+nonce unused
+
+adapter policy active
+adapter remaining >= amountIn
+# 24. Adapter validation
+Adapter получает:
+tokenIn
+tokenOut
+amountIn
+minAmountOut
+recipient
+deadline
+path/data
+Он обязан проверить:
+path.length >= 2
+path[0] == tokenIn
+path[last] == tokenOut
+Перед swap:
+adapter tokenIn balance == amountIn
+adapter tokenOut balance == 0
+Router allowance:
+approve(router, amountIn)
+После swap:
+router allowance = 0
+tokenIn balance == 0
+tokenOut balance == 0
+# 25. Swap slippage protection
+Guard должен зафиксировать:
+recipient tokenOut balance before
+После swap:
+recipient tokenOut balance after
+И проверить:
+actualOut >= minAmountOut
+# 26. Whitelist
+Whitelist используется для ограничения destination.
+Пример:
+Recipient A
+Token USDC
+Limit = 10,000 USDC
+Expiry = timestamp
+Структура:
+struct WhitelistEntry {
+    bool exists;
+    uint256 remaining;
+    uint256 expiresAt;
+}
+# 27. Whitelist rules
+Добавление:
+remaining > 0
+expiresAt >= now
+recipient not blacklisted
+token approved
+Для native:
+token == NATIVE
+разрешён отдельно.
+Изменения:
+add — 2/3 Hot;
+remove — 2/3 Hot;
+increase limit — 2/3 Hot;
+extend/change deadline — 2/3 Hot.
+Лимит нельзя незаметно увеличить через execution.
+# 28. Adapter limits
+Adapter policy работает аналогично whitelist:
+remaining
+expiresAt
+Execution:
+remaining >= amountIn
+После успешной операции:
+remaining -= amountIn
+# 29. Recovery
+Guard должен поддерживать заранее заданный recovery target.
+struct RecoveryTarget {
+    bool exists;
+    address recipient;
+}
+Recovery target существует отдельно для:
+wallet + token
+# 30. Recovery target creation
+Установка recovery target требует:
+registered Hot/Cold Wallet
+recipient != 0
+recipient not blacklisted
+token approved OR token == NATIVE
+deadline valid
+nonce unused
+2/3 Hot signatures
+Recipient должен быть включён в EIP-712 signed data.
+# 31. Recovery target cannot be arbitrary at sweep
+emergencySweep() не должен принимать произвольный recipient от caller.
+Он обязан брать:
+recoveryTargets[wallet][token].recipient
+Таким образом caller не может подменить адрес.
+# 32. Emergency Sweep
+Emergency Sweep предназначен для аварийного вывода средств.
+Условия:
+wallet registered
+wallet paused
+recovery target exists
+recovery recipient not blacklisted
+deadline valid
+nonce unused
+2/3 Hot signatures
+### Важно
+Emergency Sweep:
+НЕ требует approvedToken
+Потому что его задача — спасти даже неизвестный/не зарегистрированный токен.
+Также:
+НЕ требует Cold Owner.
+Threshold:
+2 / 3 Hot
+# 33. Emergency Sweep and subscription
+Emergency recovery никогда не должен зависеть от subscription.
+Даже:
+FREE
+expired
+no subscription
+должны иметь возможность emergency recovery.
+# 34. Pause
+Wallet должен поддерживать pause.
+Pause может инициировать:
+Guard
+Emergency Recovery Key
+Unpause:
+только Emergency Recovery Key
+Это предотвращает ситуацию, когда compromised Guard governance немедленно снимает pause.
+# 35. Emergency Recovery Key
+Каждый Smart Wallet имеет отдельный:
+address emergencyRecovery
+Это EOA.
+Он является полной аварийной custody authority для соответствующего wallet.
+Он должен уметь:
+pause
+unpause
+withdraw ERC20
+withdraw native
+Поэтому этот ключ должен храниться как критический секрет.
+# 36. Emergency Recovery Key rotation
+Нельзя мгновенно заменить recovery key.
+Используется:
+pendingEmergencyRecovery
+Новый key предлагается.
+После этого новый key принимает назначение.
+Старый key может отменить pending изменение.
+# 37. Permit2 Wallet Architecture
+Smart Wallet хранит:
+address public immutable permit2;
+Для каждого token:
+mapping(address => bool) public permit2Enabled;
+# 38. Enable Permit2
+Обычная функция:
+enablePermit2ForGuard(token)
+может вызываться только Guard.
+Условия:
+wallet not paused
+token is contract
+token approved
+Должны выполняться оба approve:
+ERC20 token -> Permit2 = MAX
+Permit2 -> Guard = MAX
+# 39. Emergency Permit2 enable
+Отдельная:
+emergencyEnablePermit2ForGuard(token)
+может работать даже при paused wallet.
+Также обязательно:
+ERC20.forceApprove(Permit2, MAX)
+Permit2.approve(token, Guard, MAX, MAX)
+# 40. Revoke Permit2
+Guard должен иметь:
+revokePermit2ForGuard(token)
+Должны быть обнулены оба разрешения:
+ERC20 -> Permit2 = 0
+Permit2 -> Guard = 0
+# 41. Permit2 allowance check
+Guard должен проверять:
+amount <= Permit2 allowance
+и:
+expiration >= block.timestamp
+### Важно
+Нельзя считать:
+expiration == 0
+бессрочным allowance.
+Для Permit2 expiration 0 означает истёкший allowance.
+# 42. Subscription system
+Subscription находится не в отдельном SubscriptionManager, а непосредственно в Guard.
+enum SubscriptionPlan {
+    FREE,
+    STANDARD,
+    PREMIUM
+}
+struct Subscription {
+    SubscriptionPlan plan;
+    uint64 expiresAt;
+}
+mapping(address => Subscription) public subscriptions;
+# 43. Subscription identity
+Subscription принадлежит:
+mainWallet
+а не:
+Hot Wallet
+Cold Wallet
+# 44. Subscription plans
+## FREE
+Включает:
+App authenticity verification
+Emergency token sending/recovery
+Emergency functionality всегда доступна независимо от subscription.
+## STANDARD — $1
+Включает FREE +
+Cold/Warm mode
+Fiat/Crypto P2P
+Security protection
+Permit / Permit2 protection
+Trading platform access
+## PREMIUM — $15
+Включает STANDARD +
+backend-only premium features
+Backend-only функции могут проверять:
+getSubscription()
+hasPermission()
+# 45. Subscription capability model
+Guard должен иметь permission bits:
+PERM_APP_VERIFY
+PERM_EMERGENCY
+PERM_COLD_WARM
+PERM_P2P
+PERM_SECURITY
+PERM_TRADING
+Например:
+FREE:
+APP_VERIFY
+EMERGENCY
+
+STANDARD:
+APP_VERIFY
+EMERGENCY
+COLD_WARM
+P2P
+SECURITY
+TRADING
+
+PREMIUM:
+STANDARD permissions
++
+future Premium-specific permissions
+# 46. Subscription expiry
+Subscription считается активной только если:
+block.timestamp < expiresAt
+Поэтому правильная проверка:
+block.timestamp >= expiresAt
+означает expired.
+Не использовать:
+block.timestamp > expiresAt
+# 47. Subscription payment
+Подписка оплачивается через Permit2.
+Payment flow:
+Smart Wallet
+      |
+      v
+Permit2
+      |
+      v
+Treasury
+Оплата разрешена только:
+STANDARD
+PREMIUM
+FREE оплачивать не нужно.
+# 48. Subscription treasury
+Guard:
+address public treasury;
+Treasury не должен быть zero.
+Изменение treasury:
+3 / 5 Owners
++
+minimum 1 Cold Owner
+# 49. Plan configuration
+Каждый plan должен иметь:
+struct PlanConfig {
+    address paymentToken;
+    uint256 price;
+    uint64 period;
+    bool enabled;
+}
+Для каждого paid plan:
+payment token
+price
+period
+enabled
+# 50. Subscription payment restrictions
+Payment token обязан быть:
+approvedToken[token] == true
+Источник оплаты:
+registered Hot Wallet
+OR
+registered Cold Wallet
+Wallet:
+not paused
+Subscription payment требует:
+2 / 3 Hot signatures
+# 51. Subscription renewal
+Если текущий plan такой же и ещё активен:
+new expiry = current expiry + period
+Если plan изменился или истёк:
+new expiry = now + period
+# 52. Trading platform registry
+Guard должен иметь:
+mapping(address => bool) public approvedTradingPlatform;
+Добавление:
+2 / 3 Hot
+Удаление:
+2 / 3 Hot
+Сам registry не является торговым контрактом.
+Он только определяет:
+какие платформы разрешены системой.
+Фактический trading execution должен отдельно проверять:
+hasPermission(mainWallet, PERM_TRADING)
+approvedTradingPlatform[platform]
+# 53. P2P configuration
+Guard хранит конфигурацию P2P entitlement/system.
+Минимально:
+address p2pAdmin;
+address p2pDAO;
+uint256 p2pTimeout;
+Изменение:
+3 / 5 Owners
++
+Cold Owner
+Guard не обязан содержать весь escrow/dispute engine.
+Фактическая P2P escrow логика должна быть отдельным контрактом.
+Guard предоставляет:
+authorization
+configuration
+subscription entitlement
+# 54. App authenticity
+Guard должен хранить:
+bytes32 appVersionHash;
+Это используется backend/client системой для проверки ожидаемой версии приложения.
+Изменение:
+2 / 3 Hot
+Backend может сравнивать:
+expected app hash
+vs
+actual app build hash
+# 55. Security entitlement
+Security permission предназначен для функций:
+malicious contract protection
+Permit protection
+Permit2 protection
+approval risk detection
+Сам Guard должен обеспечивать on-chain policy enforcement.
+Backend/security engine может использовать Guard state для анализа:
+approvedToken
+approvedRouter
+blacklist
+whitelist
+adapter
+subscription
+# 56. Не разрешать arbitrary execute
+Guard не должен становиться универсальным executor.
+Запрещено реализовывать универсальную функцию вида:
+execute(address target, bytes calldata data)
+без жёсткой policy validation.
+Особенно нельзя давать:
+arbitrary call
+arbitrary delegatecall
+arbitrary approve
+arbitrary Permit
+# 57. Delegatecall
+Guard не должен использовать delegatecall для пользовательских операций.
+Wallet также не должен предоставлять произвольный delegatecall.
+# 58. Recovery safety
+Recovery recipient должен проверяться:
+### при установке
+!blacklist[recipient]
+### при sweep
+!blacklist[storedRecipient]
+Это обязательная повторная проверка.
+Причина:
+recipient мог быть заблокирован уже после создания recovery policy.
+# 59. Migration architecture
+Guard должен поддерживать безопасную миграцию на новый Guard.
+Migration delay:
+48 hours
+# 60. Normal migration
+Flow:
+Old Guard
+   |
+   | proposeMigration(newGuard)
+   v
+48 hour timelock
+   |
+   v
+finalizeMigration()
+   |
+   v
+New Guard.acceptMigration()
+# 61. Migration restrictions
+Новый Guard:
+!= old Guard
+!= address(0)
+must be contract
+Old Guard:
+must not be migratedOut
+# 62. Migration cancellation
+Каждая отмена migration увеличивает:
+migrationCancelCount[mainWallet][newGuard]
+Максимум:
+3 cancellations
+После:
+3 cancellations
+обычная migration на этот же newGuard запрещается.
+Нужно использовать:
+emergency migration path
+# 63. Emergency migration
+Emergency migration становится доступной после:
+migrationCancelCount >= 3
+Требования:
+3 / 5 owners
++
+Cold Owner
+# 64. Migration data
+Migration должна переносить весь критический state.
+Нельзя ограничиваться только:
+owners
+tokens
+routers
+wallets
+Нужно мигрировать также:
+blacklist
+whitelist
+adapter policies
+recovery targets
+emergency key
+subscription
+treasury
+plan configs
+appVersionHash
+approvedTradingPlatform
+p2pAdmin
+p2pDAO
+p2pTimeout
+# 65. MigrationData
+Рекомендуемая структура:
+struct MigrationData {
+    address[] newOwners;
+    bool[] newIsHot;
+
+    address[] hotWallets;
+    address[] coldWallets;
+
+    address[] approvedTokens;
+    address[] approvedRouters;
+
+    address[] blacklistAddrs;
+
+    WhitelistMigrationEntry[] whitelistEntries;
+    AdapterMigrationEntry[] adapterEntries;
+    RecoveryTargetMigrationEntry[] recoveryEntries;
+
+    address migrationEmergencyKey;
+
+    SubscriptionPlan subscriptionPlan;
+    uint64 subscriptionExpiresAt;
+
+    address treasury;
+
+    PlanConfigMigrationEntry[] planConfigs;
+
+    bytes32 appVersionHash;
+
+    address[] approvedTradingPlatforms;
+
+    address p2pAdmin;
+    address p2pDAO;
+    uint256 p2pTimeout;
+}
+# 66. PlanConfig migration
+Добавить:
+struct PlanConfigMigrationEntry {
+    SubscriptionPlan plan;
+    address paymentToken;
+    uint256 price;
+    uint64 period;
+    bool enabled;
+}
+Все plan configs должны переноситься.
+# 67. Migration hash
+Все migration data должны быть включены в:
+migrationDataHash
+Подписанты фактически подтверждают полный snapshot.
+После этого новый Guard проверяет hash.
+# 68. Migration acceptance
+New Guard acceptMigration() должен проверить:
+expectedOldGuard != 0
+oldGuard == expectedOldGuard
+msg.sender == oldGuard
+oldGuard.mainWallet() == mainWallet
+oldGuard.permit2() == permit2
+oldGuard.migratedOut() == true
+# 69. Wallet migration
+Каждый Smart Wallet должен мигрироваться отдельно.
+Old Guard:
+wallet.proposeGuardMigration(newGuard)
+После:
+48h
+New Guard вызывает:
+wallet.acceptGuardMigration()
+# 70. Wallet migration validation
+Перед accept:
+wallet.guard() == expectedOldGuard
+После:
+wallet.guard() == address(this)
+Если не получилось:
+revert
+# 71. Permit2 migration
+При смене Guard старый wallet должен:
+revoke Permit2 allowance for old Guard
+revoke ERC20 -> Permit2 allowance if required
+change guard
+После migration новый Guard должен повторно enable Permit2 для нужных tokens.
+# 72. Adapter migration
+UniswapV2Adapter должен иметь immutable:
+address immutable guard_;
+address immutable router;
+Старый adapter нельзя просто переключить на новый Guard.
+Поэтому при migration:
+old adapters remain tied to old Guard
+new adapters deployed for new Guard
+Нельзя делать guard mutable только ради migration.
+# 73. Migration state flags
+Guard должен иметь:
+bool migratedOut;
+bool migrationAccepted;
+Old Guard после успешной migration:
+migratedOut = true
+New Guard:
+migrationAccepted = true
+# 74. Post-migration behavior
+После:
+migratedOut == true
+старый Guard не должен выполнять обычные operations.
+Он становится историческим source Guard.
+New Guard становится active authority.
+# 75. Migration atomicity
+Если:
+newGuard.acceptMigration()
+revert:
+entire transaction reverts
+Старый Guard не должен оставаться в состоянии:
+migratedOut = true
+при неуспешной миграции.
+# 76. Critical configuration
+Следующие параметры требуют:
+3 / 5 Owners
++
+Cold Owner
+### Обязательно:
+owner rotation;
+treasury;
+plan configuration;
+P2P configuration;
+emergency migration.
+# 77. Hot governance
+Следующие операции могут использовать:
+2 / 3 Hot
+whitelist;
+adapter policy;
+token registry;
+router registry;
+blacklist;
+app version hash;
+trading platform registry;
+wallet registry;
+recovery target;
+ordinary transfer;
+native transfer;
+swap;
+emergency sweep;
+subscription payment.
+# 78. Emergency principle
+Emergency functionality должна быть максимально независимой от обычной policy.
+Emergency sweep:
+не требует subscription
+не требует approvedToken
+не требует whitelist recipient
+не требует adapter
+не требует router
+Но обязательно:
+registered wallet
+paused wallet
+existing recovery target
+non-blacklisted recovery recipient
+valid signatures
+valid nonce
+valid deadline
+# 79. Subscription must not control custody
+Subscription не должна:
+блокировать recovery
+блокировать emergency sweep
+давать backend custody
+давать backend private keys
+давать backend arbitrary execute
+# 80. Backend
+Backend является:
+off-chain service
+и не является владельцем средств.
+Backend может читать:
+subscription
+plan
+expiry
+appVersionHash
+approvedTradingPlatform
+P2P config
+blacklist
+approvedToken
+approvedRouter
+whitelist
+adapter policy
+Но backend не должен самостоятельно распоряжаться средствами.
+# 81. No private keys on backend
+Guard architecture не должна требовать хранения:
+user seed
+private key
+recovery private key
+Hot Owner private key
+Cold Owner private key
+на backend.
+# 82. Events
+Guard должен эмитить события для всех важных изменений.
+Минимально:
+OwnerAdded
+OwnerRemoved
+OwnerChanged
+
+HotWalletAdded
+HotWalletRemoved
+
+ColdWalletAdded
+ColdWalletRemoved
+
+TokenApproved
+TokenRemoved
+
+RouterApproved
+RouterRemoved
+
+BlacklistAdded
+BlacklistRemoved
+
+WhitelistAdded
+WhitelistRemoved
+WhitelistUpdated
+WhitelistRemoved
+
+AdapterAdded
+AdapterRemoved
+AdapterUpdated
+
+RecoveryTargetSet
+
+EmergencySweepExecuted
+
+TreasuryChanged
+PlanConfigChanged
+SubscriptionPurchased
+SubscriptionUpdated
+
+TradingPlatformAdded
+TradingPlatformRemoved
+
+P2PConfigChanged
+
+AppVersionHashChanged
+
+MigrationProposed
+MigrationCancelled
+MigrationFinalized
+MigrationAccepted
+
+WalletMigrationStarted
+WalletMigrationAccepted
+Events должны содержать достаточно данных для backend indexer.
+# 83. Reentrancy
+Все операции, которые:
+переводят средства
+вызывают внешний contract
+вызывают router
+вызывают adapter
+должны иметь соответствующую reentrancy protection.
+# 84. Checks-Effects-Interactions
+Где возможно:
+1. validate
+2. consume nonce
+3. update limits/state
+4. external call
+Если внешний call revert — вся transaction должна revert и state rollback.
+# 85. ERC20 assumptions
+Для текущей версии допускается assumption:
+standard ERC20
+Не гарантируется корректная работа с:
+fee-on-transfer;
+rebasing tokens;
+ERC777-style hooks;
+нестандартными токенами.
+Такие токены должны быть исключены из approved registry либо поддержка добавляется отдельным adapter.
+# 86. forceApprove
+При работе с токенами, где стандартный:
+approve()
+может не работать при ненулевом старом allowance, использовать:
+forceApprove()
+Особенно для:
+ERC20 -> Permit2
+Adapter -> Router
+# 87. Deadline
+Все user-sensitive операции должны иметь deadline.
+После:
+block.timestamp > deadline
+операция должна revert.
+Deadline должен входить в EIP-712 hash.
+# 88. Replay protection
+Каждая подписанная операция должна иметь nonce.
+После использования:
+usedNonces[scope][nonce] = true;
+Повторное выполнение невозможно.
+Nonce должен входить в EIP-712 digest.
+# 89. Chain replay protection
+EIP-712 domain должен включать:
+chainId
+verifyingContract
+Это предотвращает перенос signature на другую chain/Guard.
+# 90. Signature malleability
+Запрещать high-s.
+Использовать low-s validation.
+# 91. Zero-address protection
+Все critical addresses должны проверяться:
+!= address(0)
+Особенно:
+owner;
+wallet;
+token;
+router;
+adapter;
+recipient;
+treasury;
+emergency key;
+new Guard.
+# 92. Contract checks
+Адреса, которые должны быть контрактами:
+address.code.length > 0
+Проверять для:
+Guard;
+Smart Wallet;
+Permit2;
+token;
+router;
+adapter;
+new Guard;
+trading platform, если архитектура требует contract.
+# 93. Emergency ordering
+Для emergencySweep() сначала рекомендуется:
+check wallet registered
+и только потом:
+wallet.paused()
+Это не security bypass, но предотвращает ненужные external calls/reverts для произвольного адреса.
+# 94. Access modifiers
+Не использовать только:
+onlyOwner
+для всех функций.
+Должны существовать логические режимы:
+Hot governance
+Critical governance
+Migration state
+Not migrated
+Wallet-specific authorization
+Emergency authorization
+# 95. Migration cancellation security
+Нормальная migration должна быть:
+proposal
+→ 48h delay
+→ finalization
+Она может быть отменена до execution.
+После 3 отмен:
+normal migration blocked
+и используется emergency migration.
+# 96. State enumerability
+Для migration все mapping entries, которые нужно переносить, должны иметь соответствующие arrays/indexes либо формироваться off-chain snapshot.
+Причина:
+Solidity mappings нельзя полностью enumerate on-chain.
+Поэтому должны существовать tracked lists для:
+wallets;
+tokens;
+routers;
+blacklist;
+whitelist;
+adapters;
+recovery targets;
+trading platforms;
+owners.
+# 97. Migration gas
+Для MVP допускается одна atomic migration.
+Но если state станет большим:
+batch migration
+является отдельным следующим этапом.
+Не нужно усложнять v5.1.4 batch-механизмом без необходимости.
+# 98. Subscription migration
+При migration переносить:
+plan
+expiresAt
+Для:
+mainWallet
+Если subscription отсутствует:
+FREE / expiresAt = 0
+является валидным default state.
+# 99. Configuration migration
+Обязательно переносить:
+treasury
+
+FREE/STANDARD/PREMIUM plan configs
+
+appVersionHash
+
+approvedTradingPlatform
+
+p2pAdmin
+p2pDAO
+p2pTimeout
+Иначе после migration часть функциональности Guard будет потеряна.
+# 100. Permission enforcement
+Нельзя ограничиваться только:
+hasPermission()
+как view-функцией.
+Если функция должна быть доступна только определённой subscription:
+сама execution function должна проверять entitlement.
+Например:
+P2P execution -> PERM_P2P
+Trading execution -> PERM_TRADING
+Cold/Warm mode -> PERM_COLD_WARM
+Security functionality -> PERM_SECURITY
+Backend-only capabilities могут проверяться off-chain.
+# 101. Premium
+В текущей версии Premium может не иметь дополнительных on-chain permissions, если все Premium features действительно backend-only.
+Если в будущем появятся on-chain Premium features:
+добавить отдельный permission bit.
+Не нужно маскировать Premium под Standard.
+# 102. Subscription payment from Cold Wallet
+Технически разрешить:
+Hot Wallet
+Cold Wallet
+для оплаты subscription.
+Если бизнес-логика позже потребует:
+только Hot Wallet
+это можно изменить отдельным policy.
+# 103. Treasury security
+Treasury:
+не должен автоматически получать governance rights
+Treasury только получает subscription payment.
+Guard не должен иметь:
+treasury private key
+# 104. P2P architecture
+Guard не является полноценным P2P marketplace.
+Guard отвечает за:
+subscription entitlement
+P2P configuration
+authorization
+Escrow/dispute engine должен быть отдельным контрактом.
+# 105. Trading architecture
+Guard не является DEX.
+Он только определяет:
+какие trading platforms разрешены
+есть ли у пользователя trading entitlement
+Конкретные adapter contracts обеспечивают execution.
+# 106. Security architecture
+Основная security model:
+Wallet
+   ↓
+Permit2
+   ↓
+Guard
+   ↓
+Policy validation
+   ↓
+Adapter / recipient
+Нельзя обойти Guard через:
+arbitrary wallet execute
+arbitrary Permit2 allowance
+arbitrary adapter
+arbitrary router
+# 107. Trust boundaries
+### Trusted
+Owners
+Guard
+Smart Wallet
+approved adapters
+approved routers
+approved tokens
+### Semi-trusted
+backend
+trading platforms
+P2P contracts
+### Untrusted
+arbitrary tokens
+arbitrary routers
+arbitrary contracts
+arbitrary recipients
+Untrusted contracts должны быть blocked by default.
+# 108. Default deny
+Главный принцип:
+DEFAULT DENY
+Если:
+token не approved
+router не approved
+adapter не approved
+recipient не whitelisted
+address blacklisted
+subscription отсутствует
+wallet не зарегистрирован
+операция должна revert.
+# 109. Emergency exception
+Единственное принципиальное исключение:
+Emergency Sweep
+может работать с:
+unapproved token
+потому что emergency rescue не должен зависеть от обычного registry.
+# 110. Security invariant
+Ни одна обычная функция Guard не должна позволять:
+user → arbitrary target → arbitrary calldata
+без прохождения policy.
+# 111. Expected external interfaces
+Guard должен взаимодействовать минимум с:
+interface ISmartWallet {
+    function guard() external view returns (address);
+    function permit2() external view returns (address);
+    function paused() external view returns (bool);
+
+    function enablePermit2ForGuard(address token) external;
+    function emergencyEnablePermit2ForGuard(address token) external;
+
+    function revokePermit2ForGuard(address token) external;
+
+    function sendNativeByGuard(
+        address payable to,
+        uint256 amount
+    ) external;
+
+    function proposeGuardMigration(address newGuard) external;
+    function acceptGuardMigration() external;
+}
+# 112. Permit2 interface
+Нужны минимум:
+allowance(owner, token, spender)
+approve(token, spender, amount, expiration)
+transferFrom(from, to, amount, token)
+# 113. Guard views
+Guard должен предоставлять view functions минимум для:
+getSubscription()
+activePlan()
+hasPermission()
+getPlanConfig()
+getWhitelist()
+getAdapterPolicy()
+getRecoveryTarget()
+Также публичные mappings должны позволять backend indexer получать state.
+# 114. Version
+После исправлений текущей версии:
+v5.1.3
+следующая должна быть:
+v5.1.4
+Не использовать v5.1.3 после внесения изменений.
+# 115. Что обязательно исправить относительно DeepSeek v5.1.3
+## FIX 1 — Permit2 expiration
+Было:
+require(
+    exp == 0 || uint256(exp) >= block.timestamp,
+    "permit2 allowance expired"
+);
+Нужно:
+require(
+    uint256(exp) >= block.timestamp,
+    "permit2 allowance expired"
+);
+## FIX 2 — subscription expiry
+Было логически:
+block.timestamp > expiresAt
+Нужно считать subscription expired при:
+block.timestamp >= expiresAt
+## FIX 3 — migration
+Добавить перенос:
+treasury
+planConfigs
+appVersionHash
+approvedTradingPlatform
+p2pAdmin
+p2pDAO
+p2pTimeout
+## FIX 4 — permissions
+Проверки subscription должны реально использоваться execution functions, а не только существовать как view.
+## FIX 5 — emergency sweep
+Должно оставаться:
+2 / 3 Hot
+а не:
+3 / 5 + Cold
+## FIX 6 — recovery blacklist
+Проверять blacklist:
+при setRecoveryTarget
+при emergencySweep
+## FIX 7 — migration cancel limit
+Обычный migration запрещать после:
+MAX_MIGRATION_CANCELS = 3
+для конкретного:
+mainWallet + newGuard
+# 116. Critical security properties
+Контракт считается корректным только если гарантируются следующие invariants:
+### Invariant 1
+Ни один unregistered wallet не может использовать Guard.
+### Invariant 2
+Ни один unapproved token не может использоваться в обычном transfer/swap/subscription payment.
+### Invariant 3
+Ни один unapproved router не может использоваться.
+### Invariant 4
+Ни один unapproved adapter не может использоваться.
+### Invariant 5
+Blacklist имеет приоритет над whitelist.
+### Invariant 6
+Удаление из registry немедленно прекращает новые операции.
+### Invariant 7
+Subscription не может заблокировать emergency recovery.
+### Invariant 8
+Emergency Sweep не позволяет caller выбрать произвольный recipient.
+### Invariant 9
+Recovery recipient повторно проверяется на blacklist.
+### Invariant 10
+Обычная операция требует правильного signature threshold.
+### Invariant 11
+Critical operation требует Cold Owner.
+### Invariant 12
+Nonce нельзя использовать повторно.
+### Invariant 13
+Expired deadline запрещает execution.
+### Invariant 14
+Expired Permit2 allowance запрещает execution.
+### Invariant 15
+Old Guard после migration не может продолжать обычное управление.
+### Invariant 16
+Migration не может успешно завершиться без 48h delay, кроме предусмотренного emergency migration path.
+### Invariant 17
+Emergency migration не может быть вызвана до достижения cancellation threshold.
+### Invariant 18
+Backend не получает custody.
+### Invariant 19
+Guard не содержит пользовательские средства.
+### Invariant 20
+Ни одна функция не должна предоставлять arbitrary call/delegatecall.
+# 117. Test requirements
+Перед deploy обязательны Foundry tests.
+Минимальный набор:
+## Owners
+2/3 Hot succeeds
+1/3 Hot fails
+3/5 without Cold fails
+3/5 + Cold succeeds
+duplicate signatures fail
+invalid signer fails
+high-s fails
+bad-v fails
+## Nonce
+first execution succeeds
+same nonce second execution fails
+## Deadline
+valid deadline succeeds
+expired deadline fails
+## Tokens
+approved token succeeds
+unapproved token fails
+removed token fails
+blacklisted token fails
+## Recipient
+whitelisted recipient succeeds
+non-whitelisted recipient fails
+blacklisted recipient fails
+## Swap
+approved adapter succeeds
+wrong guard adapter fails
+unapproved router fails
+blacklisted router fails
+bad path fails
+wrong tokenIn fails
+wrong tokenOut fails
+insufficient output fails
+adapter remaining limit enforced
+## Emergency
+paused wallet succeeds
+unpaused wallet fails
+2 hot succeeds
+1 hot fails
+3/5 is not required
+unapproved token can be swept
+blacklisted recovery recipient fails
+arbitrary recipient fails
+## Permit2
+valid allowance succeeds
+expired allowance fails
+expiration == 0 fails
+revoked allowance fails
+## Subscription
+FREE default
+STANDARD payment
+PREMIUM payment
+wrong plan fails
+expired plan becomes FREE
+renewal extends correctly
+treasury receives funds
+unapproved payment token fails
+paused wallet payment fails
+## Migration
+proposal
+48h delay
+early finalize fails
+cancel
+three cancels
+fourth normal proposal fails
+emergency migration path
+migration hash mismatch
+wrong old Guard
+wrong mainWallet
+wrong Permit2
+wallet migration
+adapter old Guard rejection
+new adapter works
+subscription migration
+treasury migration
+plan config migration
+app hash migration
+trading registry migration
+P2P config migration
+# 118. Fuzz tests
+Обязательно fuzz:
+amount
+nonce
+deadline
+signatures
+owners
+recipient
+token
+router
+adapter
+whitelist limits
+subscription expiry
+plan price
+migration arrays
+Особенно:
+uint160 boundary
+uint64 expiry boundary
+block.timestamp == expiresAt
+block.timestamp == deadline
+remaining == amount
+remaining < amount
+# 119. Invariant tests
+Foundry invariant tests должны проверять:
+Guard never transfers to blacklisted recipient
+Guard never executes unapproved router
+Guard never executes unapproved token
+Guard never executes unregistered wallet
+used nonce never becomes reusable
+migrated old Guard cannot execute ordinary operations
+emergency sweep recipient always equals stored recovery target
+# 120. Deployment sequence
+Рекомендуемый порядок:
+1. Deploy Permit2
+2. Deploy Guard
+3. Deploy Hot Wallets
+4. Deploy Cold Wallets
+5. Register wallets
+6. Register approved tokens
+7. Register approved routers
+8. Deploy adapters
+9. Register adapters
+10. Configure whitelist
+11. Configure recovery targets
+12. Configure treasury
+13. Configure subscription plans
+14. Configure trading platforms
+15. Configure P2P
+16. Set appVersionHash
+17. Enable Permit2 for required tokens
+18. Run full test suite
+19. Verify contracts
+20. Only then fund wallets
+# 121. Deployment safety
+До первого депозита необходимо проверить:
+Guard address
+Permit2 address
+mainWallet
+owners
+Hot/Cold classification
+wallet.guard()
+wallet.permit2()
+approved tokens
+approved routers
+adapters
+treasury
+subscription plans
+recovery targets
+emergency keys
+# 122. No funds in Guard
+Guard должен иметь:
+0 user funds
+Если ERC20 случайно попал в Guard:
+это не должно становиться частью normal user execution.
+Можно предусмотреть отдельную governance-controlled rescue function только если она абсолютно ограничена и не создаёт arbitrary execution path.
+# 123. Final architecture
+Итоговая модель:
+GOVERNANCE
+                 ┌────────────────────┐
+                 │  3 Hot + 2 Cold    │
+                 └─────────┬──────────┘
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │ SmartWalletGuard │
+                  │     v5.1.4       │
+                  └────────┬─────────┘
+                           │
+        ┌──────────────────┼────────────────────┐
+        │                  │                    │
+        ▼                  ▼                    ▼
+   Hot Wallets        Cold Wallets         Subscriptions
+        │                  │                    │
+        └──────────┬───────┘                    │
+                   │                            │
+                   ▼                            ▼
+                Permit2                  Treasury / Backend
+                   │
+                   ▼
+                 Guard
+                   │
+          ┌────────┼─────────┐
+          │        │         │
+          ▼        ▼         ▼
+       Transfer   Swap     Native
+                    │
+                    ▼
+                 Adapter
+                    │
+                    ▼
+                  Router
+                    │
+                    ▼
+                   DEX
+# 124. Главный security принцип
+Вся система должна строиться вокруг следующего правила:
+WALLET DOES NOT TRUST THE DESTINATION.
+GUARD DECIDES WHAT IS ALLOWED.
+Wallet не должен иметь возможность самостоятельно отправить средства на произвольный адрес через универсальный executor.
+Guard не должен иметь возможность произвольно выполнять calldata.
+Backend не должен иметь custody.
+Subscription не должна управлять custody.
+Permit2 не должен превращаться в unrestricted spending authority.
+Каждая операция должна проходить через:
+Wallet
+→ Guard
+→ Signature validation
+→ Registry validation
+→ Blacklist validation
+→ Policy validation
+→ Limit validation
+→ Permit2 / Adapter
+→ Execution
+А emergency flow должен быть отдельным узким исключением:
+Wallet paused
+→ Stored recovery target
+→ 2/3 Hot
+→ Emergency Sweep
+# 125. Definition of Done
+SmartWalletGuard v5.1.4 считается готовым к deployment только если:
+все пункты этого ТЗ реализованы;
+DeepSeek v5.1.3 fixes сохранены;
+Permit2 expiration исправлен;
+subscription expiry boundary исправлен;
+весь subscription/config state мигрируется;
+permissions реально enforced;
+emergency sweep = 2/3 Hot;
+recovery blacklist проверяется дважды;
+migration cancellation limit работает;
+wallet migration протестирована;
+Foundry unit tests проходят;
+fuzz tests проходят;
+invariant tests проходят;
+compilation проходит без warnings, влияющих на security;
+deployment script проходит на testnet;
+contracts verified;
+независимый security review выполнен перед использованием значительных средств.
+До выполнения этих условий Guard не считать production-ready.

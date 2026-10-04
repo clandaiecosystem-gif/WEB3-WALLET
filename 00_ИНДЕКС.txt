@@ -1,0 +1,30 @@
+SmartWalletGuard v6.1.0 — состав папки «ДЛЯ ГПТ»
+==============================================================================
+
+ВСЕ_ФАЙЛЫ_ОДНИМ_ТЕКСТОМ.txt — все файлы подряд, для вставки в чат одним куском
+00_ИНДЕКС.txt — этот файл
+
+01_ОТЧЁТ_v6.1.txt                          13465 байт  Отчёт по v6.1: adapters удалены, contract-level policy, token risk, migration в Hub
+02_ОТЧЁТ_v6.0_аудит_v5.2.1.txt             25406 байт  Аудит исходного v5.2.1: 45 498 байт, делегирование авторизации Service и др.
+10_GuardOps.txt                            11641 байт  Общий EIP-712 кодек: домен, структурные хеши, recover
+11_GuardInterfaces.txt                     13705 байт  Общие интерфейсы без реализаций
+12_OwnerRegistry.txt                       12117 байт  Владельцы 3 Hot/2 Cold, подписи, thresholds, nonce, реестр кошельков
+13_PolicyRegistry_v6.1.txt                 36257 байт  Contract-level policy + token risk categories, адаптеров нет
+14_Subscriptions.txt                       36950 байт  Подписка, plan configs, treasury, contract policy / token risk операции
+15_Guard_v6.1.txt                          36685 байт  Core: transfer / executeOnContract / approveOnContract / emergencySweep
+16_MigrationModule.txt                     12837 байт  Применение снапшота миграции на новом Guard-е
+17_MigrationHub.txt                        15473 байт  Единственный источник истины по состоянию миграции
+20_TestBase.txt                             3374 байт  Минимальная тестовая база без forge-std
+21_Mocks.txt                                4856 байт  MockERC20, MockPermit2, MockWallet
+22_GuardFixture.txt                        12436 байт  Стенд: 5 owners, реальные подписи через vm.sign
+23_Tests_Policy_1-21.txt                   17905 байт  21 тест: contract policy / GREEN / YELLOW / RED / supply / approve
+24_Tests_Migration_22-38.txt               20340 байт  17 тестов: migration, emergency sweep, subscription
+30_foundry.toml.txt                          309 байт  Конфиг Foundry: solc 0.8.30, viaIR, optimizer 200
+31_build.js.txt                             3553 байт  Харнесс компиляции и отчёта по размерам runtime/init
+32_solc-driver.js.txt                       1253 байт  Драйвер soljson (Standard JSON)
+33_abi_check.py.txt                         2155 байт  Сверка вызовов интерфейсов с ABI контрактов-целей
+34_compile_tests.js.txt                     2967 байт  Компиляция тестов + подсчёт test_* функций
+35_download.js.txt                           914 байт  Вспомогательный загрузчик (solc / Foundry)
+40_ТЗ_v5.1.4_извлечённое.txt               50758 байт  ТЗ SmartWalletGuard v5.1.4, извлечённое из docx
+
+ИТОГ: 22 файлов + объединённый файл + индекс

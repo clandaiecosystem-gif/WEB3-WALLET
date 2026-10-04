@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { GuardTestBase, Vm } from "./TestBase.sol";
+import { SmartWalletGuard } from "../contracts/SmartWalletGuard-v6.1.0.sol";
+import { SmartWalletGuardOwnerRegistry } from "../contracts/SmartWalletGuardOwnerRegistry-v6.0.0.sol";
+import { SmartWalletPolicyRegistry } from "../contracts/SmartWalletPolicyRegistry-v6.1.0.sol";
+import { SmartWalletGuardSubscriptions } from "../contracts/SmartWalletGuardSubscriptions-v6.0.0.sol";
+import { SmartWalletMigrationHub } from "../contracts/SmartWalletMigrationHub-v6.1.0.sol";
+import { SmartWalletGuardMigrationModule } from "../contracts/SmartWalletGuardMigrationModule-v6.1.0.sol";
+import { MockERC20, MockPermit2, MockWallet } from "./Mocks.sol";
+
+/* =========================================================================
+   Стенд SmartWalletGuard v6.1.0
+   =========================================================================
+   5 owners: 3 Hot (0x1111, 0x2222, 0x3333) + 2 Cold (0x4444, 0x5555).
+   Подписи собираются реально через vm.sign — проверяются thresholds,
+   порядок, дубликаты и Cold-требование.
+   ========================================================================= */
+
+contract GuardFixture is GuardTestBase {
+    uint256 internal constant HOT1_PK = 0x1111;
+    uint256 internal constant HOT2_PK = 0x2222;
+    uint256 internal constant HOT3_PK = 0x3333;
+    uint256 internal constant COLD1_PK = 0x4444;
+    uint256 internal constant COLD2_PK = 0x5555;
+
+    address internal hot1;
+    address internal hot2;
+    address internal hot3;
+    address internal cold1;
+    address internal cold2;
+    address internal mainWallet;
+
+    MockPermit2 internal permit2;
+    MockERC20 internal usd;   // GREEN, 6 decimals
+    MockERC20 internal meme;  // RED, 18 decimals
+    MockERC20 internal mid;   // YELLOW, 18 decimals
+    MockWallet internal wallet;
+    MockERC20 internal dex;   // доверенный контракт-цель
+
+    SmartWalletGuardOwnerRegistry internal ownerRegistry;
+    SmartWalletGuard internal guard;
+    SmartWalletPolicyRegistry internal policy;
+    SmartWalletGuardSubscriptions internal subs;
+    SmartWalletMigrationHub internal hub;
+    SmartWalletGuardMigrationModule internal migrationModule;
+
+    uint256 internal constant USD_UNIT = 1e6;      // 1 micro-USD
+    uint256 internal constant DOLLAR = 1e6;        // $1 в микро-USD
+    uint256 internal constant HUNDRED = 100 * DOLLAR;
+    uint256 internal constant WEEK = 7 days;
+    uint256 internal constant DAY_SECONDS = 1 days;
+
+    function setUp() public virtual {
+        hot1 = vm.addr(HOT1_PK);
+        hot2 = vm.addr(HOT2_PK);
+        hot3 = vm.addr(HOT3_PK);
+        cold1 = vm.addr(COLD1_PK);
+        cold2 = vm.addr(COLD2_PK);
+        mainWallet = vm.addr(0xA11CE);
+
+        address[] memory owners = new address[](5);
+        owners[0] = hot1;
+        owners[1] = hot2;
+        owners[2] = hot3;
+        owners[3] = cold1;
+        owners[4] = cold2;
+        bool[] memory isHot = new bool[](5);
+        isHot[0] = true;
+        isHot[1] = true;
+        isHot[2] = true;
+
+        permit2 = new MockPermit2();
+        usd = new MockERC20();
+        usd.setDecimals(6);
+        meme = new MockERC20();
+        mid = new MockERC20();
+
+        ownerRegistry = new SmartWalletGuardOwnerRegistry(address(permit2));
+        guard = new SmartWalletGuard(mainWallet, address(ownerRegistry), address(permit2), address(0));
+        ownerRegistry.setGuard(address(guard));
+
+        policy = new SmartWalletPolicyRegistry(address(guard));
+        subs = new SmartWalletGuardSubscriptions(
+            mainWallet, address(permit2), address(policy), address(ownerRegistry)
+        );
+        hub = new SmartWalletMigrationHub(mainWallet, address(permit2));
+        migrationModule = new SmartWalletGuardMigrationModule(
+            address(guard), address(hub), address(ownerRegistry), address(policy), address(subs)
+        );
+
+        guard.configureModules(address(policy), address(subs), address(hub), address(migrationModule));
+        guard.initializeOwners(owners, isHot);
+        hub.bindGuard(address(guard));
+
+        wallet = new MockWallet();
+        wallet.setGuard(address(guard));
+        wallet.setPermit2(address(permit2));
+        vm.deal(address(wallet), 100 ether);
+
+        dex = new MockERC20();
+
+        // Базовая конфигурация реестров выполняется от имени Guard-а: в
+        // production это делают подписанные policy-операции через
+        // Subscriptions, здесь проверяется уже применённая policy.
+        _asGuardPolicyAddToken(address(usd));
+        _asGuardPolicyAddToken(address(meme));
+        _asGuardPolicyAddToken(address(mid));
+        _asGuardPolicyAddRouter(address(dex));
+        _asGuardPolicyAddPlatform(address(dex));
+
+        // Категории и цены
+        _setRisk(address(usd), SmartWalletPolicyRegistry.TokenRiskCategory.GREEN);
+        _setPrice(address(usd), 1e18, 6); // $1.00
+        _setRisk(address(mid), SmartWalletPolicyRegistry.TokenRiskCategory.YELLOW);
+        _setRisk(address(meme), SmartWalletPolicyRegistry.TokenRiskCategory.RED);
+
+        _registerWallet();
+    }
+
+    // =========================================================================
+    // Вызовы от имени Guard-а (в production — через подписанные user-ops)
+    // =========================================================================
+
+    function _asGuardPolicyAddToken(address token) internal {
+        vm.prank(address(guard));
+        policy.addToken(token);
+    }
+
+    function _asGuardPolicyAddRouter(address router) internal {
+        vm.prank(address(guard));
+        policy.addRouter(router);
+    }
+
+    function _asGuardPolicyAddPlatform(address platform) internal {
+        vm.prank(address(guard));
+        policy.addTradingPlatform(platform);
+    }
+
+    function _setRisk(address token, SmartWalletPolicyRegistry.TokenRiskCategory cat) internal {
+        vm.prank(address(guard));
+        policy.setTokenRisk(token, cat);
+    }
+
+    function _setPrice(address token, uint256 priceE18, uint8 dec) internal {
+        vm.prank(address(guard));
+        policy.setTokenPrice(token, priceE18, dec);
+    }
+
+    function _setContractPolicy(address t, bool blocked, uint256 usdLimit, uint256 shareBps, uint256 deadline)
+        internal
+    {
+        vm.prank(address(guard));
+        policy.setContractPolicy(t, blocked, usdLimit, shareBps, deadline);
+    }
+
+    function _setAmountPolicy(address t, address token, uint256 maxAmount, uint256 shareBps) internal {
+        vm.prank(address(guard));
+        policy.setTokenAmountPolicy(t, token, maxAmount, shareBps);
+    }
+
+    function _setDefaultShare(uint256 bps) internal {
+        vm.prank(address(guard));
+        policy.setDefaultTransferShareBps(bps);
+    }
+
+    // =========================================================================
+    // Подписи
+    // =========================================================================
+
+    function _sign(uint256 pk, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _twoHot(bytes32 digest) internal view returns (bytes[] memory sigs) {
+        sigs = new bytes[](2);
+        sigs[0] = _sign(HOT1_PK, digest);
+        sigs[1] = _sign(HOT2_PK, digest);
+    }
+
+    function _threeCritical(bytes32 digest) internal view returns (bytes[] memory sigs) {
+        sigs = new bytes[](3);
+        sigs[0] = _sign(HOT1_PK, digest);
+        sigs[1] = _sign(HOT2_PK, digest);
+        sigs[2] = _sign(COLD1_PK, digest);
+    }
+
+    function _oneHot(bytes32 digest) internal view returns (bytes[] memory sigs) {
+        sigs = new bytes[](1);
+        sigs[0] = _sign(HOT1_PK, digest);
+    }
+
+    // =========================================================================
+    // Кошелёк
+    // =========================================================================
+
+    function _walletDigest(address w, bool isHot, uint256 nonce, uint256 deadline)
+        internal view returns (bytes32)
+    {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", guard.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("PolicyOp(address mainWallet,uint8 kind,uint8 op,bytes32 data1,bytes32 data2,uint256 value1,uint256 value2,uint256 nonce,uint256 deadline)"),
+                mainWallet, uint8(1), uint8(1), bytes32(bytes20(w)), bytes32(0),
+                isHot ? uint256(1) : uint256(0), uint256(0), nonce, deadline
+            ))
+        ));
+    }
+
+    function _registerWallet() internal {
+        bytes32 dgst = _walletDigest(address(wallet), true, 1, type(uint256).max);
+        guard.addWallet(address(wallet), true, 1, type(uint256).max, _twoHot(dgst));
+    }
+
+    /// @dev Зачисляет токен в кошелёк (через Permit2) и выдаёт allowance Guard-у.
+    function _fund(address token, uint256 amount) internal {
+        MockERC20(token).setBalance(address(wallet), amount);
+        MockERC20(token).setBalance(address(permit2), amount);
+        permit2.setAllowance(address(wallet), token, address(guard), type(uint160).max, type(uint48).max);
+    }
+
+    function _balanceOf(address token, address who) internal view returns (uint256) {
+        return MockERC20(token).balanceOf(who);
+    }
+
+    // =========================================================================
+    // Digest для executeOnContract / approveOnContract
+    // =========================================================================
+
+    function _onContractDigest(
+        address w, address t, address token, uint256 amount, address recipient,
+        bool strict, uint256 nonce, uint256 deadline
+    ) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", guard.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("OnContract(address mainWallet,address wallet,address target,address token,uint256 amount,address recipient,bool strict,uint256 nonce,uint256 deadline)"),
+                mainWallet, w, t, token, amount, recipient, strict, nonce, deadline
+            ))
+        ));
+    }
+
+    function _approveDigest(
+        address w, address spender, address token, uint256 amount,
+        bool strict, uint256 nonce, uint256 deadline
+    ) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", guard.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("ApproveOnContract(address mainWallet,address wallet,address spender,address token,uint256 amount,bool strict,uint256 nonce,uint256 deadline)"),
+                mainWallet, w, spender, token, amount, strict, nonce, deadline
+            ))
+        ));
+    }
+
+    function _transferDigest(
+        address w, address token, address recipient, uint256 amount, uint256 nonce, uint256 deadline
+    ) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", guard.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("Transfer(address wallet,address token,address recipient,uint256 amount,uint256 nonce,uint256 deadline)"),
+                w, token, recipient, amount, nonce, deadline
+            ))
+        ));
+    }
+
+    function _sweepDigest(address w, address token, address recipient, uint256 nonce, uint256 deadline)
+        internal view returns (bytes32)
+    {
+        return keccak256(abi.encodePacked(
+            "\x19\x01", guard.DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(
+                keccak256("EmergencySweep(address wallet,address token,address recipient,uint256 nonce,uint256 deadline)"),
+                w, token, recipient, nonce, deadline
+            ))
+        ));
+    }
+
+    /// @dev Даёт подписку STANDARD, чтобы исполняющие функции прошли entitlement.
+    function _grantStandard() internal {
+        vm.prank(address(guard));
+        subs.claimSubscription(1, uint64(block.timestamp + 365 days));
+    }
+
+    function _grantFree() internal {
+        vm.prank(address(guard));
+        subs.claimSubscription(0, 0);
+    }
+}

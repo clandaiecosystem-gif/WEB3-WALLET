@@ -1,0 +1,343 @@
+# SmartWalletGuard: аудит, исправления и архитектурная переработка
+
+Проверены: ТЗ `SmartWalletGuard v5.1.4.docx` (извлечён в `spec-v5.1.4.txt`),
+монолитный `SmartWalletGuardCore-v5.2.1.sol`, `SmartWalletService-v1.0.1.sol`,
+`SmartWalletService.t.sol` и черновики (`новый гуард поделен.txt`,
+`вторая часть к поделенному гуарду.txt`).
+
+Исходники на Desktop **не изменялись**. Результат — новый набор `contracts/*`.
+
+## 1. Главное: контракт v5.2.1 невозможно развернуть
+
+Утверждение из прежнего `REVIEW.md` подтверждено измерением, но с важным
+уточнением: проверить это раньше не могли, потому что **компилятор не запускался**.
+Я скачал `soljson-v0.8.30` и запустил реальный solc.
+
+```text
+Solidity 0.8.30, optimizer 200, viaIR — фактический результат компиляции
+contract                              runtime       init
+SmartWalletGuardCore                    45498      47369   TOO BIG (лимит 24576)
+SmartWalletService                      21092      22202
+
+тот же код с optimizer runs=1 (попытка выиграть на размере):
+SmartWalletGuardCore                    45043      46914   TOO BIG
+SmartWalletService                      20962      22072
+```
+
+Практические следствия, которые прежний отчёт не отметил:
+
+1. `deployedBytecode.object` v5.2.1 **45 498 байт** при лимите EIP-170
+   **24 576 байт** — развёртывание невозможно ни при каких настройках
+   оптимизатора: `runs=1` даёт 45 043 байта, то есть выигрыш 455 байт (1.0 %).
+2. **Initcode** v5.2.1 — **47 369 байт** при лимите EIP-3860
+   (Shanghai) **49 152 байта**. То есть запас 1 783 байта: добавление кода или
+   более длинных revert-строк ломает уже саму попытку деплоя.
+3. Значит утверждение «30 обычных Service unit-сценариев… 33 passed»
+   описывало тесты `Service`, но **не** Guard-а. Тестов Guard-а в поставке
+   нет вообще.
+
+## 2. Что ещё проверено в поставке
+
+### 2.1 Тестовый файл `SmartWalletService.t.sol` в текущем виде не является валидным Foundry-тестом
+
+```solidity
+interface Vm {
+    function expectRevert(bytes calldata) external;   // у Foundry возвращает Vm
+}
+vm.expectRevert(bytes("plan disabled"));              // компилятор обязан ругаться
+```
+
+`vm.expectRevert` в Foundry объявлен как `returns (Vm)`. Объявление в тестовом
+файле не соответствует реальному интерфейсу, поэтому либо файл не компилируется
+против настоящего `Vm`, либо тест не работает. Дополнительно: все проверки
+сделаны через `require(...)`, то есть падение теста возможно только через
+revert.
+
+### 2.2 «Service» владел авторизацией Guard-а — это критическая ошибка модели
+
+В v5.2.1 Guard спрашивал разрешения у внешнего контракта (`service`):
+
+```solidity
+require(ICoreService(currentService).hasPermission(mainWallet, permission), "subscription permission required");
+```
+
+`service` — обычный state, устанавливаемый 3/5 + Cold. Пока `service` не
+установлен, `transfer`, `transferNative`, `executeSwap` **не работают вообще**
+(«service not set»). Как только установлен — весь subscription-gate делегирован
+внешнему контракту, который Guard не контролирует: контракт-клон с
+`hasPermission() == true` открывает кошелёк. Это нарушает ТЗ §42 («подписка
+хранится в Guard»), §79 («подписка не должна управлять custody») и §100
+(«execution function должна проверять entitlement сама»).
+
+### 2.3 Подписка записывалась до оплаты
+
+```solidity
+subscriptions[mainWallet] = Subscription(plan, uint64(nextExpiry));
+core.collectSubscriptionPayment(uint8(plan), fromWallet, nonce, deadline, signatures);
+```
+
+В той же транзакции — но при revert оплаты откатывается и запись. Реальная
+проблема не в атомарности, а в том, что **цены и включённость тарифа живут в
+Service, а исполнение платежа — в Core**: расхождение состояния и оплаты
+разнесено по двум контрактам, а `Core.collectSubscriptionPayment` требует
+собственные подписи владельцев и собственный nonce-скоуп, поэтому платёж и
+подписка не образуют одного проверяемого действия.
+
+### 2.4 `proposeMigrationWithEmergency` практически неработоспособен
+
+```solidity
+uint256 executeAfter = block.timestamp;
+bytes32 digest = ...(MIGRATION_EMERGENCY_TYPEHASH, ..., nonce, executeAfter, deadline);
+require(_recover(digest, emergencySignature) == migrationEmergencyKey, "invalid emergency key");
+```
+
+`block.timestamp` входит в подписываемый digest, а `executeAfter` берётся из
+него же. Подпись emergency-ключа валидна только в том блоке, в котором она была
+создана: офлайн-подпись не проходит. Это же повторено в Service. Emergency-путь
+(ТЗ §62/§63, Invariant 17) фактически недоступен.
+
+### 2.5 Двойная регистрация платформ/роутеров
+
+`Core` проверял `approvedRouter[router]`, а `Service` — собственный
+`approvedTradingPlatform[router]`. Swap проходит только если контракт разрешён
+**в обоих** реестрах, а обновлять их нужно двумя разными наборами подписей.
+Любое расхождение = swap невозможен, при этом ТЗ §52 требует один реестр в Guard.
+
+### 2.6 Отсутствуют данные для TZ-требования §96 (state enumerability)
+
+Монолитный Core не хранил никаких списков: `hotWallets`, `coldWallets`,
+`approvedToken`, `approvedRouter`, `blacklist`, `whitelist`, `adapterPolicy`,
+`recoveryTargets` — голые mapping-и. `acceptMigration` принимает элементы
+снапшота и проверяет каждый по отдельности, но **проверить полноту** (что
+переданы все записи) невозможно: старый контракт не отдаёт списки. ТЗ §96
+требует tracked lists именно для этого.
+
+### 2.7 Прочие дефекты v5.2.1
+
+| Дефект | Где | Последствие |
+|---|---|---|
+| `changeOwners` допускал дубликаты в `newOwners` в `changeOwners` | Core | проверка только `newOwners[j] != newOwners[i]` — на самом деле есть; в `acceptMigration` тоже есть. Снято с учёта после проверки. |
+| `removeToken` не снимает whitelist-записи этого токена | Core | записи остаются «мёртвыми», но `transfer`/`swap` их отклоняют — поведение корректное, риск только в миграционном шуме. |
+| Whitelist-операции без `nonReentrant` | Core | внешних вызовов нет, поэтому безопасно. |
+| `_checkPermit2Allowance` без явного `exp != 0` | Core | требует ТЗ §41 / FIX 1; на практике совпадает, но формально нарушено. |
+| Строковые revert-причины на 45 КБ | Core | ~4-5 КБ лишнего кода; при лимите EIP-170 это прямое ограничение. |
+
+## 3. Что сделано: архитектура v6.0.0
+
+Контракт разбит по ответственности. Каждый deployable-контракт проверен
+компилятором на соответствие лимиту.
+
+```text
+Solidity 0.8.30, optimizer 200, viaIR — фактический результат
+contract                                 runtime       init
+SmartWalletGuard                           23629      24737
+SmartWalletGuardOwnerRegistry               5760       5928
+SmartWalletPolicyRegistry                  12853      13173
+SmartWalletGuardSubscriptions              22456      23626
+GuardOps (library)                            57         85
+лимит EIP-170 / EIP-3860                   24576      49152
+0 errors, 0 warnings
+```
+
+| Контракт | Ответственность |
+|---|---|
+| `SmartWalletGuard` | авторизация и исполнение: transfer, native transfer, swap, emergency sweep, recovery target, owner rotation, wallet registry, migration hooks |
+| `SmartWalletGuardOwnerRegistry` | владельцы 3 Hot / 2 Cold, проверка подписей, thresholds, Cold-требование, nonce, реестр Smart Wallet |
+| `SmartWalletPolicyRegistry` | whitelist, adapter policies, blacklist, approved tokens/routers/trading platforms, recovery targets + enumerable-списки для миграции |
+| `SmartWalletGuardSubscriptions` | подписка, plan configs, treasury, appVersionHash, P2P-конфиг, policy-вызовы с подписями |
+| `GuardOps` | общий EIP-712 кодек (домен, структурные хеши, recover) |
+| `GuardInterfaces` | общие интерфейсы без реализаций (разрывает циклические импорты) |
+
+`SmartWalletGuard` — 23 629 байт при лимите 24 576, запас 947 байт;
+`SmartWalletGuardSubscriptions` — 22 456 байт, запас 2 120 байт. Это осознанное
+следствие того, что Guard обязан остаться единственным контрактом, который
+двигает средства через Permit2: вынести исполнение означало бы второго
+спендера Permit2 и отдельное разрешение от каждого кошелька. Любое добавление
+кода в эти два контракта требует сначала что-то вынести.
+
+Привязки не принимаются на веру и проверяются обеими сторонами:
+
+* `SmartWalletGuard.constructor` → `ownerRegistry.guard() == address(this)`;
+* `OwnerRegistry.setGuard` → вызывающий обязан ссылаться на этот OwnerRegistry;
+* `Guard.configureModules` → `policyRegistry.isBoundTo(address(this))` и
+  `subscriptions.isBoundTo(address(this))`; поэтому функция безопасна для
+  любого вызывающего и не даёт подсунуть чужой контракт.
+
+### 3.1 Исправленные ошибки
+
+1. **Deployability.** 45 498 → 23 629 байт у основного контракта; все четыре
+   deployable-контракта ниже лимита EIP-170, initcode — с большим запасом до
+   49 152.
+2. **Entitlement перенесён внутрь системы.** Убрана зависимость от внешнего
+   «Service». Подписка и permission mask считаются в
+   `SmartWalletGuardSubscriptions`, созданном той же системой и жёстко
+   привязанном к Guard-у. Никакой контракт со стороны больше не может выдать
+   права. (ТЗ §42, §79, §100, §108.)
+3. **Атомарная подписка.** `subscribe` теперь одно действие:
+   проверки → consumed nonce → подписи 2/3 Hot → проверка Permit2 allowance →
+   `Permit2.transferFrom(wallet → treasury)` → запись плана. Нет окна
+   «план записан, оплата не прошла».
+4. **Permit2 expiration.** `expiration == 0` трактуется как истёкший allowance,
+   требуется `expiration >= block.timestamp` (ТЗ §41, FIX 1).
+5. **Emergency sweep независим от подписки и реестров.** Не проверяет
+   `PERM_*`, не требует `approvedToken`, не требует whitelist; получатель
+   берётся только из `recoveryTargets[wallet][token]`, blacklist получателя
+   проверяется повторно в момент исполнения (ТЗ §32/§33/§58/§78, FIX 5, FIX 6,
+   Invariant 7/8/9).
+6. **Swap требует ровно один реестр роутеров и один реестр платформ**
+   (`SmartWalletPolicyRegistry`): двойной контроль v5.2.1 снят, расхождение
+   состояний невозможно.
+7. **Whitelist получателя при swap применяется атомарно к фактическому
+   результату.** `PolicyRegistry.consumeWhitelist` проверяет и списывает в
+   одном вызове, поэтому favorable slippage не может превысить лимит
+   (ТЗ §25).
+8. **Enumerable-состояние для миграции.** Все миграционно-значимые множества
+   имеют tracked-списки: `getBlacklist`, `getApprovedTokens`,
+   `getApprovedRouters`, `getTradingPlatforms`, `getWhitelistKeys`,
+   `getAdapterKeys`, `getRecoveryKeys` (ТЗ §96).
+9. **Custom errors вместо строк** — во всех контрактах v6.
+10. **Все подписи через один кодек.** `GuardOps` фиксирует
+    `verifyingContract == address(this)`, поэтому подпись нельзя перенести на
+    другой Guard или другую сеть (ТЗ §89). `PolicyOp` различает операции по
+    `kind`/`op`, коллизии между разными операциями невозможны.
+11. **Разделены шаги инициализации:** `configureModules` (permissionless, но
+    адреса валидируются обратной привязкой) и `initializeOwners` (только hub).
+    Установить произвольный состав владельцев нельзя даже фронтраннингом.
+
+### 3.2 Сохранённое поведение ТЗ
+
+Проверено по пунктам: 5 владельцев (3 Hot / 2 Cold), thresholds 2/3 и 3/5+Cold,
+nonce-скоупы (hot wallet для исполнения, mainWallet для governance),
+deadline во всех подписываемых операциях, whitelist/blacklist/registry
+проверки в момент исполнения, migration 48 h + максимум 3 отмены,
+подписка привязана к `mainWallet`, `block.timestamp >= expiresAt` = expired,
+renewal того же тарифа от текущего expiry, смена тарифа от now.
+
+## 4. Честные ограничения и что осталось
+
+1. **`SmartWalletMigrationHub` не включён в поставку.** Guard отдаёт весь
+   необходимый интерфейс миграции (`setHub`, `markMigratedOut`,
+   `acceptMigrationIn`, `claimOwners`, `claimWallet`, `claimSubscription`,
+   `claimConfiguration`, `claimPolicy`, `claimMigrationEmergencyKey`,
+   `consumeGovernanceNonce`, `proposeWalletGuardMigration`,
+   `acceptWalletGuardMigration`, `enablePermit2OnWallet`,
+   `revokePermit2OnWallet`), но сам координатор со снапшотом, 48-часовым
+   таймлоком и emergency-путём в этой поставке отсутствует. Он должен быть
+   реализован и протестирован отдельно: лимит EVM по-прежнему диктует
+   разделение. Не считайте миграцию готовой, пока этого нет.
+2. **`proposeMigrationWithEmergency` (фикс из §2.4) относится к хабу.** Пока
+   хаб не реализован, дефект экс-таймстемпа не закрыт.
+3. **Кошелёк (`SmartHotWallet` / `SmartColdWallet`) и адаптер в поставке
+   отсутствуют.** Проверены только интерфейсные вызовы
+   (`sendNativeByGuard`, `proposeGuardMigration`, `acceptGuardMigration`,
+   `emergencyEnablePermit2ForGuard`, `revokePermit2ForGuard`). Реальное
+   поведение `onlyGuard`, лимитов и pause/unpause не подтверждено.
+4. **Adapter требует перевыпуска при миграции.** `adapter.guard()` —
+   immutable, поэтому `Registry.addAdapter` вызывает `ISwapAdapter(adapter).guard()`
+   и отклонит старый адаптер. В снапшоте миграции нужна пара
+   `oldAdapter → newAdapter` (структуры для этого в интерфейсе есть).
+5. **Тесты не запускались.** Foundry в окружении не установлен, а существующий
+   `SmartWalletService.t.sol` не соответствует реальному интерфейсу `Vm`
+   (см. §2.1). Проверка v6 — это компиляция реальным solc 0.8.30 и разбор
+   кода; Foundry-набор для v6 нужно написать.
+6. **Nonce после миграции.** `usedNonces` живёт в `OwnerRegistry` и в снапшот
+   не входит. Практическое следствие: после миграции нужно либо переносить
+   счётчик использованных nonce, либо сменить диапазон nonce-ов у клиента,
+   иначе подписи, сделанные до миграции и не исполненные, останутся
+   валидными на новом Guard-е (они привязаны к адресу Guard-а, поэтому
+   уязвимы только подписи, собранные уже под новый Guard).
+7. **P2P on-chain endpoint отсутствует** (как и указано в ТЗ §104: escrow —
+   отдельный контракт). Guard отдаёт только `canUseP2P()`.
+
+## 5. Как это проверено (воспроизводимо)
+
+Foundry в окружении отсутствует, поэтому компиляция выполнена настоящим
+`solc` 0.8.30 (сборка emscripten, `soljson-v0.8.30+commit.73712a01.js`),
+запущенным через Node:
+
+```text
+tools/solc-driver.js          — драйвер soljson (Standard JSON)
+tools/build.js                — компиляция + отчёт по размерам runtime/init
+tools/abi_check.py            — сверка: каждый вызов интерфейса модуля
+                                существует в ABI контракта-цели
+```
+
+Команда:
+
+```powershell
+node tools/build.js tools/soljson-0.8.30.js build `
+  contracts/GuardOps.sol contracts/GuardInterfaces.sol `
+  contracts/SmartWalletGuardOwnerRegistry-v6.0.0.sol `
+  contracts/SmartWalletPolicyRegistry-v6.0.0.sol `
+  contracts/SmartWalletGuardSubscriptions-v6.0.0.sol `
+  contracts/SmartWalletGuard-v6.0.0.sol
+```
+
+`tools/abi_check.py` нашёл реальный пропуск (`setHub` отсутствовал у двух
+модулей, хотя Guard его вызывал) — то есть это не формальная, а рабочая
+проверка целостности после разделения. Итог: `interface calls checked: 50,
+problems: 0`.
+
+Проверка не заменяет Foundry-тесты: она подтверждает, что код компилируется,
+укладывается в лимиты и что модули согласованы по сигнатурам. Поведение
+(подписи, лимиты, миграция) статической проверкой не подтверждается.
+
+## 6. Изменения публичного API относительно v5.2.1
+
+Ломающие — это осознанная цена устранения §2.2/§2.5:
+
+| v5.2.1 | v6.0.0 |
+|---|---|
+| `transfer/addWhitelist/...` требуют установленного `service` | `service` больше нет; entitlement внутри системы |
+| `setService(address,nonce,deadline,sigs)` | удалено |
+| `collectSubscriptionPayment(...)` на Core | `subscribe(plan,fromWallet,nonce,deadline,sigs)` |
+| `addHotWallet/addColdWallet` | `addWallet(wallet,isHot,nonce,deadline,sigs)` |
+| `addWhitelist` и др. на Core | на `SmartWalletGuardSubscriptions` (Guard отдаёт `subscriptions()`) |
+| revert-строки | custom errors |
+| `whitelist[recipient][token]` публичный mapping | `getWhitelistEntry(...)` / `getWhitelistKeys()` |
+| `adapters` | `adapterPolicy` + `getAdapterKeys()` |
+
+## 7. Рекомендуемый порядок развёртывания
+
+```text
+1.  new SmartWalletGuardOwnerRegistry(permit2)
+2.  new SmartWalletGuard(mainWallet, ownerRegistry, permit2, expectedOldGuard)
+3.  ownerRegistry.setGuard(guard)        // привязка проверяется внутри setGuard
+4.  new SmartWalletPolicyRegistry(guard)
+5.  new SmartWalletGuardSubscriptions(mainWallet, permit2, policyRegistry, ownerRegistry)
+6.  guard.configureModules(policyRegistry, subscriptions)
+        // безопасно вызывать кому угодно: оба модуля обязаны ссылаться
+        // ровно на этот Guard (isBoundTo)
+7.  guard.initializeOwners(owners, isHot)
+        // только hub; hub = адрес, создавший Guard
+8.  guard.setHub(multisig)               // передача управления
+9.  subscriptions.addToken / addRouter / addTradingPlatform / addWhitelist /
+    addAdapter / addBlacklist  (2/3 Hot) и guard.setRecoveryTarget (3/5 + Cold)
+10. subscriptions.setTreasury / setPlanConfig / setAppVersionHash / setP2PConfig
+11. guard.addWallet(hot, true, ...) / guard.addWallet(cold, false, ...)
+12. wallet.emergencyEnablePermit2ForGuard(token) для нужных токенов
+13. Только после этого — пополнение кошельков (ТЗ §120/§121)
+```
+
+Шаги 6 и 7 разделены намеренно: привязка модулей безопасна для любого
+вызывающего (адреса валидируются обратной привязкой), а состав владельцев
+устанавливает только hub. Фронтраннинг инициализации невозможен.
+
+Проверка перед первым депозитом: `guard()` и `permit2()` каждого кошелька,
+`ownerRegistry.getOwners()`, `guard.permissionMask()`,
+`subscriptions.getPlanConfig()`, списки `policyRegistry`, `treasury`,
+recovery targets, `migrationEmergencyKey`.
+
+## 8. Вердикт
+
+* v5.2.1 **не был работоспособен**: не разворачивался (45 498 байт runtime при
+  лимите 24 576; initcode 47 369 при лимите 49 152) и делегировал авторизацию
+  кошелька внешнему контракту.
+* v6.0.0 в предоставленном объёме **компилируется и влезает в лимиты**
+  (проверено реальным solc 0.8.30), устраняет перечисленные в §3.1 дефекты
+  и сохраняет поведение ТЗ. Расхождений сигнатур между модулями нет
+  (`abi_check.py`, 50/50).
+* **Production-ready считать нельзя**, пока не реализованы и не
+  протестированы хаб миграции, кошелёк и адаптер, и пока нет Foundry-набора
+  тестов (ТЗ §117/§118/§119). Это ровно те условия, которые перечисляет
+  §125 «Definition of Done».

@@ -1,0 +1,118 @@
+// Build/report harness: compiles the contract set with solc and prints sizes.
+// Usage: node build.js <soljsonPath> <outDir> <source...>
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const soljson = process.argv[2];
+const outDir = process.argv[3];
+let rest = process.argv.slice(4);
+let runs = 200;
+const runsIdx = rest.indexOf('--runs');
+if (runsIdx !== -1) {
+  runs = Number(rest[runsIdx + 1]);
+  rest = rest.slice(0, runsIdx).concat(rest.slice(runsIdx + 2));
+}
+const sources = rest;
+
+const sourceMap = {};
+for (const s of sources) {
+  sourceMap[path.basename(s)] = { content: fs.readFileSync(s, 'utf8') };
+}
+
+const input = {
+  language: 'Solidity',
+  sources: sourceMap,
+  settings: {
+    optimizer: { enabled: true, runs },
+    viaIR: true,
+    outputSelection: {
+      '*': {
+        '*': [
+          'abi',
+          'evm.bytecode.object',
+          'evm.bytecode.linkReferences',
+          'evm.deployedBytecode.object',
+          'evm.deployedBytecode.linkReferences',
+        ],
+      },
+    },
+  },
+};
+
+fs.mkdirSync(outDir, { recursive: true });
+const inputPath = path.join(outDir, 'input.json');
+const outputPath = path.join(outDir, 'output.json');
+fs.writeFileSync(inputPath, JSON.stringify(input));
+
+const runner = path.join(__dirname, 'solc-driver.js');
+const res = spawnSync(process.execPath, [runner, soljson, inputPath, outputPath], {
+  stdio: 'inherit',
+});
+if (res.error) {
+  console.error('spawn error', res.error);
+  process.exit(1);
+}
+
+if (!fs.existsSync(outputPath)) {
+  console.error('no compiler output produced');
+  process.exit(1);
+}
+
+const out = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+const errors = (out.errors || []).filter((e) => e.severity === 'error');
+const warnings = (out.errors || []).filter((e) => e.severity === 'warning');
+
+for (const e of errors) {
+  console.log(`ERROR ${e.type} ${e.formattedMessage}`);
+}
+for (const w of warnings) {
+  console.log(`WARN  ${w.type} ${w.formattedMessage}`);
+}
+
+if (errors.length) {
+  console.log(`\n${errors.length} error(s), ${warnings.length} warning(s)`);
+  process.exit(2);
+}
+
+const libAddresses = {
+  GuardOps: '00000000000000000000000000000000deadbeef',
+};
+
+function linkCount(refs) {
+  if (!refs) return 0;
+  let n = 0;
+  for (const file of Object.keys(refs)) {
+    for (const lib of Object.keys(refs[file])) n += refs[file][lib].length;
+  }
+  return n;
+}
+
+console.log(`\n0 errors, ${warnings.length} warning(s)\n`);
+console.log('contract'.padEnd(34), 'runtime'.padStart(10), 'init'.padStart(10), 'libs'.padStart(6));
+console.log('-'.repeat(64));
+for (const file of Object.keys(out.contracts || {})) {
+  for (const name of Object.keys(out.contracts[file])) {
+    const c = out.contracts[file][name];
+    const runtime = (c.evm.deployedBytecode.object || '').length / 2;
+    const init = (c.evm.bytecode.object || '').length / 2;
+    if (init === 0) continue;
+    const libs = linkCount(c.evm.deployedBytecode.linkReferences);
+    const flag = runtime > 24576 ? '  TOO BIG' : '';
+    console.log(
+      name.padEnd(34),
+      String(runtime).padStart(10),
+      String(init).padStart(10),
+      String(libs).padStart(6) + flag
+    );
+    fs.writeFileSync(path.join(outDir, name + '.abi.json'), JSON.stringify(c.abi, null, 2));
+    fs.writeFileSync(
+      path.join(outDir, name + '.deployed.txt'),
+      c.evm.deployedBytecode.object || ''
+    );
+    fs.writeFileSync(
+      path.join(outDir, name + '.links.json'),
+      JSON.stringify(c.evm.deployedBytecode.linkReferences || {}, null, 2)
+    );
+  }
+}

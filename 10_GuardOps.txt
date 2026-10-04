@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+/* =========================================================================
+   GuardOps — общий кодек подписей SmartWalletGuard v6.0.0
+   =========================================================================
+   Единая точка для EIP-712 домена, структурных хешей и восстановления
+   подписчиков. Используется Guard-ом, OwnerRegistry, SubscriptionManager и
+   MigrationHub, поэтому digests, которые считает клиент, совпадают у всех
+   участников (verifyingContract = адрес Guard-а).
+
+   Типы операций (все включают nonce и deadline):
+
+     Transfer(address wallet,address token,address recipient,uint256 amount,uint256 nonce,uint256 deadline)
+     NativeTransfer(address wallet,address recipient,uint256 amount,uint256 nonce,uint256 deadline)
+     Swap(address wallet,address adapter,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,address recipient,bytes32 adapterDataHash,uint256 nonce,uint256 deadline)
+     EmergencySweep(address wallet,address token,address recipient,uint256 nonce,uint256 deadline)
+     Subscribe(address mainWallet,uint8 plan,address paymentToken,uint256 price,address fromWallet,uint256 nonce,uint256 deadline)
+
+     PolicyOp(address mainWallet,uint8 kind,uint8 op,bytes32 data1,bytes32 data2,uint256 value1,uint256 value2,uint256 nonce,uint256 deadline)
+
+   Для PolicyOp layout полей фиксирован по (kind, op) и описан в
+   `policyHash*` функциях ниже — на одну пару (kind, op) ровно один layout.
+   ========================================================================= */
+
+library GuardOps {
+
+    bytes32 internal constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 internal constant TRANSFER_TYPEHASH = keccak256(
+        "Transfer(address wallet,address token,address recipient,uint256 amount,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant NATIVE_TRANSFER_TYPEHASH = keccak256(
+        "NativeTransfer(address wallet,address recipient,uint256 amount,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant SWAP_TYPEHASH = keccak256(
+        "Swap(address wallet,address adapter,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,address recipient,bytes32 adapterDataHash,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant SWEEP_TYPEHASH = keccak256(
+        "EmergencySweep(address wallet,address token,address recipient,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant SUBSCRIBE_TYPEHASH = keccak256(
+        "Subscribe(address mainWallet,uint8 plan,address paymentToken,uint256 price,address fromWallet,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant POLICY_TYPEHASH = keccak256(
+        "PolicyOp(address mainWallet,uint8 kind,uint8 op,bytes32 data1,bytes32 data2,uint256 value1,uint256 value2,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant POLICY_DEEP_TYPEHASH = keccak256(
+        "PolicyOpDeep(address mainWallet,uint8 kind,uint8 op,bytes32 data1,bytes32 data2,uint256 value1,uint256 value2,uint256 extra,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant OWNERS_TYPEHASH = keccak256(
+        "ChangeOwners(address mainWallet,bytes32 ownersHash,bytes32 isHotHash,uint256 nonce,uint256 deadline)");
+    bytes32 internal constant MIGRATION_TYPEHASH = keccak256(
+        "Migration(address mainWallet,address newGuard,bytes32 migrationDataHash,uint256 nonce,uint256 executeAfter,uint256 deadline,bool emergency)");
+    bytes32 internal constant CANCEL_MIGRATION_TYPEHASH = keccak256(
+        "CancelMigration(address mainWallet,address newGuard,uint256 nonce,uint256 deadline)");
+    /// @dev Расход внутрь доверенного контракта (замена adapter-пути).
+    bytes32 internal constant ON_CONTRACT_TYPEHASH = keccak256(
+        "OnContract(address mainWallet,address wallet,address target,address token,uint256 amount,address recipient,bool strict,uint256 nonce,uint256 deadline)");
+    /// @dev Approve на конкретную сумму в пользу контракта.
+    bytes32 internal constant APPROVE_TYPEHASH = keccak256(
+        "ApproveOnContract(address mainWallet,address wallet,address spender,address token,uint256 amount,bool strict,uint256 nonce,uint256 deadline)");
+
+    bytes32 internal constant SECP256K1N_HALF =
+        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+
+    error BadSignatureLength();
+    error BadSignatureValue();
+    error HighSValue();
+    error ZeroSigner();
+
+    function domainSeparator(uint256 chainId, address verifyingContract) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            DOMAIN_TYPEHASH,
+            keccak256(bytes("SmartWalletGuard")),
+            keccak256(bytes("6.0.0")),
+            chainId,
+            verifyingContract
+        ));
+    }
+
+    function _digest(bytes32 ds, bytes32 structHash_) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", ds, structHash_));
+    }
+
+    // --------------------------- структурные хеши ---------------------------
+
+    function transferHash(
+        address wallet, address token, address recipient, uint256 amount, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(TRANSFER_TYPEHASH, wallet, token, recipient, amount, nonce, deadline));
+    }
+
+    function nativeTransferHash(
+        address wallet, address recipient, uint256 amount, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(NATIVE_TRANSFER_TYPEHASH, wallet, recipient, amount, nonce, deadline));
+    }
+
+    function swapHash(
+        address wallet, address adapter, address tokenIn, address tokenOut, uint256 amountIn,
+        uint256 minAmountOut, address recipient, bytes32 adapterDataHash, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            SWAP_TYPEHASH, wallet, adapter, tokenIn, tokenOut, amountIn,
+            minAmountOut, recipient, adapterDataHash, nonce, deadline));
+    }
+
+    function sweepHash(address wallet, address token, address recipient, uint256 nonce, uint256 deadline)
+        internal pure returns (bytes32)
+    {
+        return keccak256(abi.encode(SWEEP_TYPEHASH, wallet, token, recipient, nonce, deadline));
+    }
+
+    function subscribeHash(
+        address mainWallet, uint8 plan, address paymentToken, uint256 price, address fromWallet,
+        uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            SUBSCRIBE_TYPEHASH, mainWallet, plan, paymentToken, price, fromWallet, nonce, deadline));
+    }
+
+    /// @dev PolicyOp с двумя «свободными» 32-байтовыми словами. Layout задаётся
+    ///      вызывающим кодом ровно один раз на пару (kind, op).
+    function policyHash(
+        address mainWallet, uint8 kind, uint8 op, bytes32 data1, bytes32 data2,
+        uint256 value1, uint256 value2, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            POLICY_TYPEHASH, mainWallet, kind, op, data1, data2, value1, value2, nonce, deadline));
+    }
+
+    function policyHashAddrs(
+        address mainWallet, uint8 kind, uint8 op, address a, address b,
+        uint256 value1, uint256 value2, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return policyHash(
+            mainWallet, kind, op, bytes32(bytes20(a)), bytes32(bytes20(b)),
+            value1, value2, nonce, deadline);
+    }
+
+    function policyHashVals(
+        address mainWallet, uint8 kind, uint8 op, uint256 value1, uint256 value2,
+        uint256 value3, uint256 value4, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return policyHash(
+            mainWallet, kind, op, bytes32(value1), bytes32(value2),
+            value3, value4, nonce, deadline);
+    }
+
+    /// @dev Вариант с дополнительным policy-значением (например срок действия):
+    ///      data1 = адрес A, data2 = адрес B, value1/value2 = лимиты,
+    ///      extra = срок/доп. параметр.
+    function policyHashDeep(
+        address mainWallet, uint8 kind, uint8 op, bytes32 data1, bytes32 data2,
+        uint256 value1, uint256 value2, uint256 extra, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            POLICY_DEEP_TYPEHASH, mainWallet, kind, op, data1, data2, value1, value2, extra, nonce, deadline));
+    }
+
+    function changeOwnersHash(
+        address mainWallet, bytes32 ownersHash, bytes32 isHotHash, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(OWNERS_TYPEHASH, mainWallet, ownersHash, isHotHash, nonce, deadline));
+    }
+
+    function onContractHash(
+        address mainWallet, address wallet, address target, address token, uint256 amount,
+        address recipient, bool strict, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            ON_CONTRACT_TYPEHASH, mainWallet, wallet, target, token, amount, recipient, strict, nonce, deadline));
+    }
+
+    function approveHash(
+        address mainWallet, address wallet, address spender, address token, uint256 amount,
+        bool strict, uint256 nonce, uint256 deadline
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            APPROVE_TYPEHASH, mainWallet, wallet, spender, token, amount, strict, nonce, deadline));
+    }
+
+    function migrationHash(
+        address mainWallet, address newGuard, bytes32 migrationDataHash,
+        uint256 nonce, uint256 executeAfter, uint256 deadline, bool emergency
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            MIGRATION_TYPEHASH, mainWallet, newGuard, migrationDataHash, nonce, executeAfter, deadline, emergency));
+    }
+
+    function cancelMigrationHash(address mainWallet, address newGuard, uint256 nonce, uint256 deadline)
+        internal pure returns (bytes32)
+    {
+        return keccak256(abi.encode(CANCEL_MIGRATION_TYPEHASH, mainWallet, newGuard, nonce, deadline));
+    }
+
+    function digestOf(bytes32 ds, bytes32 structHash_) internal pure returns (bytes32) {
+        return _digest(ds, structHash_);
+    }
+
+    // --------------------------- подписи ---------------------------
+
+    function recover(bytes32 dgst, bytes calldata sig) internal pure returns (address) {
+        if (sig.length != 65) revert BadSignatureLength();
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly ("memory-safe") {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        if (v != 27 && v != 28) revert BadSignatureValue();
+        if (uint256(s) > uint256(SECP256K1N_HALF)) revert HighSValue();
+        address signer = ecrecover(dgst, v, r, s);
+        if (signer == address(0)) revert ZeroSigner();
+        return signer;
+    }
+}

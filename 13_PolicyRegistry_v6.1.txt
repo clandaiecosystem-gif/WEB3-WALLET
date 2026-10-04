@@ -1,0 +1,743 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+/* =========================================================================
+   SmartWalletGuard v6.1.0 — Policy Registry
+   =========================================================================
+   Policy-состояние Guard. Ключевые изменения относительно v6.0.0:
+
+   1.  ADAPTER ARCHITECTURE УДАЛЕНА. Нет `ISwapAdapter`, `adapterPolicy`,
+       `addAdapter/removeAdapter/spendAdapter`, нет передачи токенов сначала
+       адаптеру, нет проверок `adapter.guard()`. Guard больше не знает
+       функций конкретных DEX: есть один универсальный механизм
+       «target contract + policy».
+   2.  WHITELIST ЗАМЕНЁН НА CONTRACT-LEVEL POLICY. Больше нет
+       `whitelist[recipient][token]`. Есть `contractPolicy[targetContract]`:
+       одна запись на smart contract, а не на пару «получатель + токен».
+   3.  ДОБАВЛЕНА КАТЕГОРИЯ РИСКА ТОКЕНА (GREEN/YELLOW/RED) и строгий режим
+       по умолчанию для неизвестных токенов.
+   4.  ДОБАВЛЕН `TokenAmountPolicy` для YELLOW/RED: абсолютный лимит
+       количества + доля баланса.
+   5.  Добавлена защита от исчерпания supply: доля баланса считается
+       on-chain по `IERC20.balanceOf(wallet)` и применяется всегда
+       (ТЗ v6.1 §10, §11).
+
+   Права:
+     - `guard` — единственный контракт, которому разрешены записи;
+     - `hub`   — координатор миграции (применение снапшота).
+   Записи отклоняются, если Guard уже мигрировал наружу.
+   ========================================================================= */
+
+interface IGuardStateForRegistry {
+    function mainWallet() external view returns (address);
+    function permit2() external view returns (address);
+    function migrationHub() external view returns (address);
+}
+
+interface IMigrationHubState {
+    function finalizedOut(address guard_) external view returns (bool);
+}
+
+interface IERC20Balance {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract SmartWalletPolicyRegistry {
+
+    string public constant VERSION = "6.1.0";
+    address public constant NATIVE = address(0);
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    /// @dev Цены и USD-лимиты в целых микро-долларах (1e6 = $1).
+    uint256 public constant USD_UNIT = 1e6;
+    /// @dev Цена токена фиксируется с 18 десятичными знаками.
+    uint256 public constant PRICE_SCALE = 1e18;
+
+    /// @notice Категория риска токена. Определяется системой/владельцами, а не
+    ///         пользователем (ТЗ v6.1 §50).
+    enum TokenRiskCategory { GREEN, YELLOW, RED }
+
+    /// @notice Policy на smart contract — одна запись на контракт.
+    /// @param exists            запись настроена
+    /// @param blocked           полная блокировка контракта (§19)
+    /// @param usdLimit          общий лимит в микро-USD (1e6 = $1); 0 — автотрата
+    ///                          запрещена без strict-подписи (§15)
+    /// @param usdSpent          израсходовано в микро-USD (§16, §17)
+    /// @param maxTokenShareBps  максимальная доля текущего баланса токена в BPS
+    ///                          (2000 = 20 %) (§6, §10)
+    /// @param deadline          срок действия policy (§20)
+    struct ContractPolicy {
+        bool exists;
+        bool blocked;
+        uint256 usdLimit;
+        uint256 usdSpent;
+        uint256 maxTokenShareBps;
+        uint256 deadline;
+    }
+
+    /// @notice Policy на количество токена. Применяется к паре
+    ///         (targetContract, token) и имеет смысл для YELLOW/RED, поскольку
+    ///         «количество токена» определено только относительно токена (§7).
+    struct TokenAmountPolicy {
+        bool exists;
+        uint256 maxAmount;
+        uint256 maxBalanceShareBps;
+    }
+
+    struct TokenRisk {
+        bool configured;
+        TokenRiskCategory category;
+    }
+
+    /// @notice Ценовая конфигурация токена. Публикуется владельцами заранее и
+    ///         не является внешним вызовом во время исполнения (§25, §26).
+    struct TokenPrice {
+        bool configured;
+        uint256 priceE18;
+        uint8 decimals;
+    }
+
+    struct RecoveryTarget { bool exists; address recipient; }
+
+    address public immutable guard;
+
+    address public hub;
+    bool public claimed;
+
+    /// @notice Доля баланса по умолчанию для обычных transfer на адрес
+    ///         получателя (там нет ContractPolicy). Настраивается владельцами.
+    ///         0 = переводы на адрес получателя запрещены.
+    uint256 public defaultTransferShareBps = 2000; // 20 %
+
+    mapping(address => ContractPolicy) public contractPolicy;
+    mapping(address => mapping(address => TokenAmountPolicy)) public tokenAmountPolicy;
+    mapping(address => TokenRisk) private _tokenRisk;
+    mapping(address => TokenPrice) private _tokenPrice;
+    mapping(address => mapping(address => RecoveryTarget)) public recoveryTargets;
+
+    mapping(address => bool) public blacklist;
+    mapping(address => bool) public approvedToken;
+    mapping(address => bool) public approvedRouter;
+    mapping(address => bool) public tradingPlatform;
+
+    // enumerable-списки (ТЗ §96 v5.1.4): нужны, чтобы миграция могла перенести
+    // полный снапшот, а не только те элементы, которые перечислит вызывающий.
+    address[] private _contractList;
+    mapping(address => uint256) private _contractIdx;
+    address[] private _riskList;
+    mapping(address => uint256) private _riskIdx;
+    address[] private _priceList;
+    mapping(address => uint256) private _priceIdx;
+    address[] private _blacklistList;
+    address[] private _tokenList;
+    address[] private _routerList;
+    address[] private _platformList;
+    address[] private _recoveryKeys; // wallet||token
+
+    mapping(address => uint256) private _blacklistIdx;
+    mapping(address => uint256) private _tokenIdx;
+    mapping(address => uint256) private _routerIdx;
+    mapping(address => uint256) private _platformIdx;
+    mapping(bytes32 => bool) private _recoveryHas;
+
+    // ------------------------- errors -------------------------
+
+    error NotAuthorized();
+    error GuardMigratedOut();
+    error AlreadyClaimed();
+    error ZeroAddress();
+    error NotContract();
+    error DeadlineInPast();
+    error AlreadySet();
+    error NotSet();
+    error MustIncrease();
+    error LimitExceeded();
+    error ContractNotWhitelisted();
+    error ContractBlocked();
+    error PolicyExpired();
+    error UsdLimitExceeded();
+    error BalanceShareExceeded();
+    error UnlimitedApprove();
+    error PriceNotConfigured();
+    error BadConfig();
+    error NativeNotAllowed();
+
+    // ------------------------- events -------------------------
+
+    event ContractPolicyUpdated(
+        address indexed targetContract, bool exists, bool blocked,
+        uint256 usdLimit, uint256 maxTokenShareBps, uint256 deadline
+    );
+    event ContractPolicySpent(address indexed targetContract, address indexed token, uint256 amount, uint256 usdValue);
+    event TokenAmountPolicyUpdated(
+        address indexed targetContract, address indexed token, uint256 maxAmount, uint256 maxBalanceShareBps
+    );
+    event TokenRiskUpdated(address indexed token, TokenRiskCategory category, bool configured);
+    event TokenPriceUpdated(address indexed token, uint256 priceE18, uint8 decimals, bool configured);
+    event BlacklistUpdated(address indexed target, bool active);
+    event TokenUpdated(address indexed token, bool active);
+    event RouterUpdated(address indexed router, bool active);
+    event TradingPlatformUpdated(address indexed platform, bool active);
+    event RecoveryTargetUpdated(address indexed wallet, address indexed token, address indexed recipient, bool active);
+    event HubUpdated(address indexed oldHub, address indexed newHub);
+
+    modifier onlyGuard() {
+        if (msg.sender != guard) revert NotAuthorized();
+        _;
+    }
+
+    /// @dev Записи разрешены Guard-у, координатору `hub` и MigrationHub-у,
+    ///      которым Guard сам себя обслуживает. MigrationHub определяется
+    ///      через сам Guard (`migrationHub()`), поэтому подделать его нельзя.
+    modifier onlyWriter() {
+        if (msg.sender != guard && msg.sender != hub
+            && msg.sender != IGuardStateForRegistry(guard).migrationHub()) {
+            revert NotAuthorized();
+        }
+        _;
+    }
+
+    /// @dev Записи отклоняются, если Guard уже мигрировал наружу. Флаг живёт в
+    ///      MigrationHub — единственном источнике истины. Во время применения
+    ///      снапшота на НОВОМ Guard-е флаг ещё false, поэтому миграция проходит.
+    modifier live() {
+        address mh = IGuardStateForRegistry(guard).migrationHub();
+        if (mh != address(0) && IMigrationHubState(mh).finalizedOut(guard)) revert GuardMigratedOut();
+        _;
+    }
+
+    constructor(address guard_) {
+        if (guard_ == address(0)) revert ZeroAddress();
+        guard = guard_;
+    }
+
+    // =========================================================================
+    // Роли
+    // =========================================================================
+
+    /// @notice Доля баланса по умолчанию для transfer на адрес получателя.
+    function setDefaultTransferShareBps(uint256 bps) external onlyWriter live {
+        if (bps > BPS_DENOMINATOR) revert BadConfig();
+        defaultTransferShareBps = bps;
+    }
+
+    function isBoundTo(address candidate) external view returns (bool) {
+        return candidate == guard && candidate != address(0);
+    }
+
+    function setHub(address newHub) external onlyGuard {
+        address old = hub;
+        hub = newHub;
+        emit HubUpdated(old, newHub);
+    }
+
+    function claim(address expectedMainWallet, address expectedPermit2) external onlyGuard {
+        if (claimed) revert AlreadyClaimed();
+        if (IGuardStateForRegistry(guard).mainWallet() != expectedMainWallet) revert NotAuthorized();
+        if (IGuardStateForRegistry(guard).permit2() != expectedPermit2) revert NotAuthorized();
+        claimed = true;
+    }
+
+    // =========================================================================
+    // Contract policy — одна запись на smart contract
+    // =========================================================================
+
+    /// @notice Устанавливает/перезаписывает policy на контракт.
+    /// @param targetContract контракт, которому пользователь доверяет в рамках policy
+    /// @param usdLimit       лимит в микро-USD; 0 = автотрата запрещена (§15)
+    /// @param maxTokenShareBps доля баланса токена в BPS (2000 = 20 %)
+    /// @param deadline       срок действия
+    function setContractPolicy(
+        address targetContract,
+        bool blocked,
+        uint256 usdLimit,
+        uint256 maxTokenShareBps,
+        uint256 deadline
+    ) external onlyWriter live {
+        if (targetContract == address(0) || targetContract.code.length == 0) revert NotContract();
+        if (deadline < block.timestamp) revert DeadlineInPast();
+        if (maxTokenShareBps > BPS_DENOMINATOR) revert BadConfig();
+
+        bool isNew = !contractPolicy[targetContract].exists;
+        ContractPolicy storage p = contractPolicy[targetContract];
+        p.exists = true;
+        p.blocked = blocked;
+        p.maxTokenShareBps = maxTokenShareBps;
+        p.deadline = deadline;
+        // Лимит можно как угодно менять через governance-подпись; уже
+        // израсходованное не сбрасывается, чтобы нельзя было обнулить
+        // историю расходов.
+        p.usdLimit = usdLimit;
+
+        if (isNew) _addEnum(_contractList, _contractIdx, targetContract);
+        emit ContractPolicyUpdated(targetContract, true, blocked, usdLimit, maxTokenShareBps, deadline);
+    }
+
+    function setContractBlocked(address targetContract, bool blocked) external onlyWriter live {
+        ContractPolicy storage p = contractPolicy[targetContract];
+        if (!p.exists) revert NotSet();
+        p.blocked = blocked;
+        emit ContractPolicyUpdated(targetContract, true, blocked, p.usdLimit, p.maxTokenShareBps, p.deadline);
+    }
+
+    /// @notice Разовое применение policy при миграции: без проверки «уже
+    ///         существует», со сбросом истории расходов нового Guard-а.
+    function claimContractPolicy(
+        address targetContract, bool blocked, uint256 usdLimit, uint256 maxTokenShareBps, uint256 deadline
+    ) external onlyWriter live {
+        if (targetContract == address(0) || targetContract.code.length == 0) revert NotContract();
+        if (maxTokenShareBps > BPS_DENOMINATOR) revert BadConfig();
+        if (!contractPolicy[targetContract].exists) _addEnum(_contractList, _contractIdx, targetContract);
+        contractPolicy[targetContract] = ContractPolicy(true, blocked, usdLimit, 0, maxTokenShareBps, deadline);
+        emit ContractPolicyUpdated(targetContract, true, blocked, usdLimit, maxTokenShareBps, deadline);
+    }
+
+    function setContractDeadline(address targetContract, uint256 deadline) external onlyWriter live {
+        ContractPolicy storage p = contractPolicy[targetContract];
+        if (!p.exists) revert NotSet();
+        if (deadline < block.timestamp) revert DeadlineInPast();
+        p.deadline = deadline;
+        emit ContractPolicyUpdated(targetContract, true, p.blocked, p.usdLimit, p.maxTokenShareBps, deadline);
+    }
+
+    /// @notice Увеличивает USD-лимит, сохраняя уже израсходованное (§17).
+    function increaseContractUsdLimit(address targetContract, uint256 newUsdLimit) external onlyWriter live {
+        ContractPolicy storage p = contractPolicy[targetContract];
+        if (!p.exists) revert NotSet();
+        if (newUsdLimit <= p.usdLimit) revert MustIncrease();
+        p.usdLimit = newUsdLimit;
+        emit ContractPolicyUpdated(targetContract, true, p.blocked, newUsdLimit, p.maxTokenShareBps, p.deadline);
+    }
+
+    function removeContractPolicy(address targetContract) external onlyWriter live {
+        if (!contractPolicy[targetContract].exists) revert NotSet();
+        _removeEnum(_contractList, _contractIdx, targetContract);
+        delete contractPolicy[targetContract];
+        emit ContractPolicyUpdated(targetContract, false, false, 0, 0, 0);
+    }
+
+    // =========================================================================
+    // Token risk + token amount policy
+    // =========================================================================
+
+    /// @notice Категорию риска токена назначает система/владельцы, не пользователь.
+    function setTokenRisk(address token, TokenRiskCategory category) external onlyWriter live {
+        if (token == address(0) || token.code.length == 0) revert NotContract();
+        if (!_tokenRisk[token].configured) _addEnum(_riskList, _riskIdx, token);
+        _tokenRisk[token] = TokenRisk(true, category);
+        emit TokenRiskUpdated(token, category, true);
+    }
+
+    function clearTokenRisk(address token) external onlyWriter live {
+        if (!_tokenRisk[token].configured) revert NotSet();
+        _removeEnum(_riskList, _riskIdx, token);
+        delete _tokenRisk[token];
+        emit TokenRiskUpdated(token, TokenRiskCategory.RED, false);
+    }
+
+    /// @notice Ценовая конфигурация GREEN-токена. Задаётся заранее (ТЗ v6.1 §26).
+    function setTokenPrice(address token, uint256 priceE18, uint8 decimals) external onlyWriter live {
+        if (token == address(0) || token.code.length == 0) revert NotContract();
+        if (priceE18 == 0 || decimals > 36) revert BadConfig();
+        if (!_tokenPrice[token].configured) _addEnum(_priceList, _priceIdx, token);
+        _tokenPrice[token] = TokenPrice(true, priceE18, decimals);
+        emit TokenPriceUpdated(token, priceE18, decimals, true);
+    }
+
+    function clearTokenPrice(address token) external onlyWriter live {
+        if (!_tokenPrice[token].configured) revert NotSet();
+        _removeEnum(_priceList, _priceIdx, token);
+        delete _tokenPrice[token];
+        emit TokenPriceUpdated(token, 0, 0, false);
+    }
+
+    /// @notice Абсолютный лимит количества токена для пары (targetContract, token).
+    ///         Применяется для YELLOW/RED (§7, §8).
+    function setTokenAmountPolicy(
+        address targetContract,
+        address token,
+        uint256 maxAmount,
+        uint256 maxBalanceShareBps
+    ) external onlyWriter live {
+        if (targetContract == address(0) || token == address(0)) revert ZeroAddress();
+        if (maxBalanceShareBps > BPS_DENOMINATOR) revert BadConfig();
+        if (maxAmount == 0 && maxBalanceShareBps == 0) revert BadConfig();
+        TokenAmountPolicy storage t = tokenAmountPolicy[targetContract][token];
+        bool isNew = !t.exists;
+        t.exists = true;
+        t.maxAmount = maxAmount;
+        t.maxBalanceShareBps = maxBalanceShareBps;
+        if (isNew) emit TokenAmountPolicyUpdated(targetContract, token, maxAmount, maxBalanceShareBps);
+        else emit TokenAmountPolicyUpdated(targetContract, token, maxAmount, maxBalanceShareBps);
+    }
+
+    function removeTokenAmountPolicy(address targetContract, address token) external onlyWriter live {
+        if (!tokenAmountPolicy[targetContract][token].exists) revert NotSet();
+        delete tokenAmountPolicy[targetContract][token];
+        emit TokenAmountPolicyUpdated(targetContract, token, 0, 0);
+    }
+
+    // =========================================================================
+    // Blacklist / tokens / routers / platforms
+    // =========================================================================
+
+    function addBlacklist(address target) external onlyWriter live {
+        if (target == address(0)) revert ZeroAddress();
+        if (blacklist[target]) revert AlreadySet();
+        _addEnum(_blacklistList, _blacklistIdx, target);
+        blacklist[target] = true;
+        emit BlacklistUpdated(target, true);
+    }
+
+    function removeBlacklist(address target) external onlyWriter live {
+        if (!blacklist[target]) revert NotSet();
+        _removeEnum(_blacklistList, _blacklistIdx, target);
+        blacklist[target] = false;
+        emit BlacklistUpdated(target, false);
+    }
+
+    function addToken(address token) external onlyWriter live {
+        if (token == address(0) || token.code.length == 0) revert NotContract();
+        if (approvedToken[token]) revert AlreadySet();
+        _addEnum(_tokenList, _tokenIdx, token);
+        approvedToken[token] = true;
+        emit TokenUpdated(token, true);
+    }
+
+    function removeToken(address token) external onlyWriter live {
+        if (!approvedToken[token]) revert NotSet();
+        _removeEnum(_tokenList, _tokenIdx, token);
+        approvedToken[token] = false;
+        emit TokenUpdated(token, false);
+    }
+
+    function addRouter(address router) external onlyWriter live {
+        if (router == address(0) || router.code.length == 0) revert NotContract();
+        if (approvedRouter[router]) revert AlreadySet();
+        _addEnum(_routerList, _routerIdx, router);
+        approvedRouter[router] = true;
+        emit RouterUpdated(router, true);
+    }
+
+    function removeRouter(address router) external onlyWriter live {
+        if (!approvedRouter[router]) revert NotSet();
+        _removeEnum(_routerList, _routerIdx, router);
+        approvedRouter[router] = false;
+        emit RouterUpdated(router, false);
+    }
+
+    function addTradingPlatform(address platform) external onlyWriter live {
+        if (platform == address(0) || platform.code.length == 0) revert NotContract();
+        if (tradingPlatform[platform]) revert AlreadySet();
+        _addEnum(_platformList, _platformIdx, platform);
+        tradingPlatform[platform] = true;
+        emit TradingPlatformUpdated(platform, true);
+    }
+
+    function removeTradingPlatform(address platform) external onlyWriter live {
+        if (!tradingPlatform[platform]) revert NotSet();
+        _removeEnum(_platformList, _platformIdx, platform);
+        tradingPlatform[platform] = false;
+        emit TradingPlatformUpdated(platform, false);
+    }
+
+    // =========================================================================
+    // Recovery targets
+    // =========================================================================
+
+    function setRecoveryTarget(address wallet, address token, address recipient)
+        external onlyWriter live
+    {
+        if (recipient == address(0)) revert ZeroAddress();
+        if (!recoveryTargets[wallet][token].exists) {
+            _recoveryHas[_key(wallet, token)] = true;
+            _recoveryKeys.push(wallet);
+            _recoveryKeys.push(token);
+        }
+        recoveryTargets[wallet][token] = RecoveryTarget(true, recipient);
+        emit RecoveryTargetUpdated(wallet, token, recipient, true);
+    }
+
+    function removeRecoveryTarget(address wallet, address token) external onlyWriter live {
+        if (!recoveryTargets[wallet][token].exists) revert NotSet();
+        _removePair(_recoveryKeys, wallet, token, _key(wallet, token), _recoveryHas);
+        delete recoveryTargets[wallet][token];
+        emit RecoveryTargetUpdated(wallet, token, address(0), false);
+    }
+
+    // =========================================================================
+    // Проверки исполнения
+    // =========================================================================
+
+    /// @notice Основная проверка расхода: ContractPolicy + TokenRisk + лимиты.
+    /// @dev Возвращает израсходованное в микро-USD (для GREEN), 0 иначе.
+    ///      Изменяет `usdSpent`. Вызывается Guard-ом перед Permit2-переводом.
+    /// @param wallet  кошелёк-источник; баланс читается on-chain (ТЗ §11)
+    /// @param target  доверенный smart contract
+    /// @param token   расходуемый токен
+    /// @param amount  количество токена
+    /// @param strictExternal true, если strict-подпись (локальный ключ) уже проверена
+    function checkAndSpend(
+        address wallet,
+        address target,
+        address token,
+        uint256 amount,
+        bool strictExternal
+    ) external onlyGuard live returns (uint256 usdValue) {
+        if (token == NATIVE) revert NativeNotAllowed();
+        if (amount == 0) revert BadConfig();
+        if (blacklist[target] || blacklist[token]) revert ContractBlocked();
+
+        ContractPolicy storage p = contractPolicy[target];
+        if (!p.exists) revert ContractNotWhitelisted();
+        if (p.blocked) revert ContractBlocked();
+        if (block.timestamp > p.deadline) revert PolicyExpired();
+
+        // Лимит доли баланса действует для любой категории (§6, §7, §8, §10)
+        // и считается от баланса ДО операции, чтобы нельзя было дробить вывод.
+        _checkBalanceShare(wallet, token, amount, p.maxTokenShareBps, true);
+
+        TokenRisk memory risk = _tokenRisk[token];
+        if (risk.configured && risk.category == TokenRiskCategory.GREEN) {
+            uint256 price = _priceE18(token);
+            usdValue = _toUsdMicro(amount, price, _tokenPrice[token].decimals);
+            if (usdValue == 0) revert PriceNotConfigured();
+            // usdLimit == 0 => автотрата запрещена без strict-подписи (§15)
+            if (p.usdLimit == 0) {
+                if (!strictExternal) revert UsdLimitExceeded();
+            } else {
+                uint256 remaining = p.usdLimit > p.usdSpent ? p.usdLimit - p.usdSpent : 0;
+                if (usdValue > remaining) {
+                    if (!strictExternal) revert UsdLimitExceeded();
+                }
+            }
+            p.usdSpent += usdValue;
+        } else {
+            // YELLOW / RED / UNKNOWN — строгий режим: только абсолютное
+            // количество + доля баланса (§7, §8, §9).
+            TokenAmountPolicy memory t = tokenAmountPolicy[target][token];
+            if (t.exists && t.maxAmount > 0 && amount > t.maxAmount) {
+                if (!strictExternal) revert LimitExceeded();
+            }
+            if (t.exists && t.maxBalanceShareBps > 0) {
+                _checkBalanceShare(wallet, token, amount, t.maxBalanceShareBps, false);
+            } else if (!t.exists && !strictExternal) {
+                // Нет ни категории, ни token-лимита => нет разрешения вообще.
+                revert LimitExceeded();
+            }
+        }
+
+        emit ContractPolicySpent(target, token, amount, usdValue);
+    }
+
+    /// @notice Проверка обычного перевода на получателя (без ContractPolicy).
+    /// @dev Получатель в transfer — не доверенный контракт, а адрес назначения,
+    ///      поэтому применяется доля баланса, чтобы дешёвый токен не позволил
+    ///      вывести весь баланс (§10).
+    function checkTransferShare(
+        address wallet,
+        address token,
+        uint256 amount,
+        uint256 shareBps
+    ) external view onlyGuard returns (bool) {
+        _checkBalanceShare(wallet, token, amount, shareBps, true);
+        return true;
+    }
+
+    /// @notice Помечает расход как одобренный strict-ключом (ТЗ §14/§15/§52).
+    ///         Вызывается Guard-ом, который уже проверил подпись.
+    function consumeStrict(address target, address token, uint256 amount) external onlyGuard live {
+        ContractPolicy storage p = contractPolicy[target];
+        if (!p.exists) revert ContractNotWhitelisted();
+        if (p.blocked) revert ContractBlocked();
+        if (block.timestamp > p.deadline) revert PolicyExpired();
+        TokenRisk memory risk = _tokenRisk[token];
+        if (risk.configured && risk.category == TokenRiskCategory.GREEN) {
+            uint256 usdValue = _toUsdMicro(amount, _priceE18(token), _tokenPrice[token].decimals);
+            p.usdSpent += usdValue;
+        }
+    }
+
+    /// @notice Блокирует unlimited approval (§13) и считает расход по policy.
+    function checkApproval(
+        address wallet,
+        address spender,
+        address token,
+        uint256 amount,
+        uint256 usdLimit,
+        uint256 maxTokenShareBps
+    ) external view onlyGuard returns (bool) {
+        if (amount == type(uint256).max) revert UnlimitedApprove();
+        ContractPolicy storage p = contractPolicy[spender];
+        if (!p.exists) revert ContractNotWhitelisted();
+        if (p.blocked) revert ContractBlocked();
+        if (block.timestamp > p.deadline) revert PolicyExpired();
+        uint256 share = p.maxTokenShareBps;
+        if (maxTokenShareBps != 0 && (share == 0 || maxTokenShareBps < share)) share = maxTokenShareBps;
+        _checkBalanceShare(wallet, token, amount, share, true);
+        if (usdLimit != 0) {
+            TokenRisk memory risk = _tokenRisk[token];
+            if (risk.configured && risk.category == TokenRiskCategory.GREEN) {
+                uint256 usdValue = _toUsdMicro(amount, _priceE18(token), _tokenPrice[token].decimals);
+                uint256 remaining = p.usdLimit > p.usdSpent ? p.usdLimit - p.usdSpent : 0;
+                if (usdValue > remaining) revert UsdLimitExceeded();
+            }
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // Views
+    // =========================================================================
+
+    function getContractPolicy(address targetContract)
+        external view returns (bool exists, bool blocked, uint256 usdLimit, uint256 usdSpent, uint256 maxTokenShareBps, uint256 deadline)
+    {
+        ContractPolicy storage p = contractPolicy[targetContract];
+        return (p.exists, p.blocked, p.usdLimit, p.usdSpent, p.maxTokenShareBps, p.deadline);
+    }
+
+    function getTokenRisk(address token) external view returns (bool configured, TokenRiskCategory category) {
+        TokenRisk memory r = _tokenRisk[token];
+        return (r.configured, r.category);
+    }
+
+    /// @notice Эффективная категория токена: неизвестный токен — RED (§9).
+    function effectiveTokenRisk(address token) external view returns (TokenRiskCategory) {
+        TokenRisk memory r = _tokenRisk[token];
+        if (!r.configured) return TokenRiskCategory.RED;
+        return r.category;
+    }
+
+    function getTokenPrice(address token) external view returns (bool configured, uint256 priceE18, uint8 decimals) {
+        TokenPrice memory t = _tokenPrice[token];
+        return (t.configured, t.priceE18, t.decimals);
+    }
+
+    function getTokenAmountPolicy(address targetContract, address token)
+        external view returns (bool exists, uint256 maxAmount, uint256 maxBalanceShareBps)
+    {
+        TokenAmountPolicy memory t = tokenAmountPolicy[targetContract][token];
+        return (t.exists, t.maxAmount, t.maxBalanceShareBps);
+    }
+
+    function getRecoveryTarget(address wallet, address token)
+        external view returns (bool exists, address recipient)
+    {
+        RecoveryTarget storage rt = recoveryTargets[wallet][token];
+        return (rt.exists, rt.recipient);
+    }
+
+    /// @notice Остаток USD-лимита для UI (§18). 0, если policy не настроена.
+    function remainingUsd(address targetContract) external view returns (uint256 remaining) {
+        ContractPolicy storage p = contractPolicy[targetContract];
+        if (!p.exists) return 0;
+        return p.usdLimit > p.usdSpent ? p.usdLimit - p.usdSpent : 0;
+    }
+
+    /// @notice Максимальное количество токена, которое сейчас допустимо.
+    function maxSpendableAmount(address wallet, address targetContract, address token)
+        external view returns (uint256 byBalance)
+    {
+        ContractPolicy storage p = contractPolicy[targetContract];
+        uint256 shareBps = p.maxTokenShareBps;
+        TokenAmountPolicy memory t = tokenAmountPolicy[targetContract][token];
+        if (t.exists && t.maxBalanceShareBps != 0 && (shareBps == 0 || t.maxBalanceShareBps < shareBps)) {
+            shareBps = t.maxBalanceShareBps;
+        }
+        if (shareBps == 0) return 0;
+        uint256 balance = IERC20Balance(token).balanceOf(wallet);
+        byBalance = (balance * shareBps) / BPS_DENOMINATOR;
+        if (t.exists && t.maxAmount != 0 && byBalance > t.maxAmount) byBalance = t.maxAmount;
+    }
+
+    function getContractPolicyKeys() external view returns (address[] memory) { return _contractList; }
+    function getTokenRiskKeys() external view returns (address[] memory) { return _riskList; }
+    function getTokenPriceKeys() external view returns (address[] memory) { return _priceList; }
+    function getBlacklist() external view returns (address[] memory) { return _blacklistList; }
+    function getApprovedTokens() external view returns (address[] memory) { return _tokenList; }
+    function getApprovedRouters() external view returns (address[] memory) { return _routerList; }
+    function getTradingPlatforms() external view returns (address[] memory) { return _platformList; }
+    function getRecoveryKeys() external view returns (address[] memory) { return _recoveryKeys; }
+
+    // =========================================================================
+    // Internal
+    // =========================================================================
+
+    function _key(address a, address b) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(a, b));
+    }
+
+    function _priceE18(address token) internal view returns (uint256 price) {
+        TokenPrice memory t = _tokenPrice[token];
+        if (!t.configured || t.priceE18 == 0) revert PriceNotConfigured();
+        price = t.priceE18;
+    }
+
+    /// @dev amount * priceE18 / 10^decimals => микро-USD (1e6 = $1).
+    function _toUsdMicro(uint256 amount, uint256 priceE18, uint8 decimals) internal pure returns (uint256) {
+        uint256 numerator = amount * priceE18;
+        uint256 denom = 10 ** uint256(decimals);
+        uint256 usdE18 = numerator / denom;
+        return usdE18 / 1e12;
+    }
+
+    /// @dev Доля считается от баланса ДО операции, поэтому дробление вывода на
+    ///      много транзакций не обходит лимит.
+    function _checkBalanceShare(
+        address wallet,
+        address token,
+        uint256 amount,
+        uint256 shareBps,
+        bool required
+    ) internal view {
+        if (shareBps == 0) {
+            if (required) revert BalanceShareExceeded();
+            return;
+        }
+        uint256 balance = IERC20Balance(token).balanceOf(wallet);
+        if (balance == 0) revert BalanceShareExceeded();
+        uint256 allowed = (balance * shareBps) / BPS_DENOMINATOR;
+        if (amount > allowed) revert BalanceShareExceeded();
+    }
+
+    function _addEnum(address[] storage list, mapping(address => uint256) storage idx, address value) internal {
+        list.push(value);
+        idx[value] = list.length;
+    }
+
+    function _removeEnum(address[] storage list, mapping(address => uint256) storage idx, address value) internal {
+        uint256 pos = idx[value];
+        if (pos == 0) return;
+        uint256 last = list.length;
+        if (pos != last) {
+            address moved = list[last - 1];
+            list[pos - 1] = moved;
+            idx[moved] = pos;
+        }
+        list.pop();
+        delete idx[value];
+    }
+
+    function _removePair(
+        address[] storage list,
+        address a,
+        address b,
+        bytes32 k,
+        mapping(bytes32 => bool) storage has
+    ) internal {
+        if (has[k]) has[k] = false;
+        uint256 n = list.length / 2;
+        for (uint256 i = 0; i < n; i++) {
+            if (list[2 * i] == a && list[2 * i + 1] == b) {
+                uint256 last = n - 1;
+                if (i != last) {
+                    list[2 * i] = list[2 * last];
+                    list[2 * i + 1] = list[2 * last + 1];
+                }
+                list.pop();
+                list.pop();
+                return;
+            }
+        }
+    }
+}

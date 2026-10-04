@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { IGuardView, IOwnerRegistryView, IPolicyRegistryView, ISubscriptionsView,
+         IMigrationHubView, ISmartWalletView } from "./GuardInterfaces.sol";
+
+/* =========================================================================
+   SmartWalletGuard v6.1.0 — Migration Module
+   =========================================================================
+   Применение снапшота миграции на НОВОМ Guard-е. Вынесено из Guard-а, потому
+   что миграционный блок — самая крупная часть кода (~7 КБ) и Guard перестаёт
+   влезать в лимит EVM 24 576 байт.
+
+   Права:
+     - модуль разворачивает целевой Guard (или владельцы) и регистрирует его
+       через `guard.setMigrationModule(module)`;
+     - вызовы принимаются только если MigrationHub подтверждает, что миграция
+       на `newGuard` реально финализирована (`authorizedMigration`);
+     - запись в OwnerRegistry / PolicyRegistry / Subscriptions выполняется
+       модулем напрямую, поскольку Guard выдал ему роль migration manager.
+
+   Адаптеров в v6.1 нет, поэтому adapter policies не мигрируют (ТЗ v6.1 §34).
+   ========================================================================= */
+
+contract SmartWalletGuardMigrationModule {
+
+    string public constant VERSION = "6.1.0";
+
+    address public immutable domainGuard;
+    address public immutable migrationHub;
+    address public immutable ownerRegistry;
+    address public immutable policyRegistry;
+    address public immutable subscriptions;
+
+    bool public initialized;
+
+    struct MigrationData {
+        address[] owners;
+        bool[] isHot;
+        address[] hotWallets;
+        address[] coldWallets;
+        address[] approvedTokens;
+        address[] approvedRouters;
+        address[] blacklistAddrs;
+        address[] tradingPlatforms;
+        address[] policyContracts;
+        uint256[] policyUsdLimits;
+        uint256[] policyShareBps;
+        uint256[] policyDeadlines;
+        bool[] policyBlocked;
+        address[] riskTokens;
+        uint8[] riskCategories;
+        address[] priceTokens;
+        uint256[] priceE18;
+        uint8[] priceDecimals;
+        address[] amountTargets;
+        address[] amountTokens;
+        uint256[] amountMax;
+        uint256[] amountShareBps;
+        address[] recoveryWallets;
+        address[] recoveryTokens;
+        address[] recoveryRecipients;
+        uint8 subscriptionPlan;
+        uint64 subscriptionExpiresAt;
+        address treasury;
+        bytes32 appVersionHash;
+        address p2pAdmin;
+        address p2pDAO;
+        uint64 p2pTimeout;
+        uint256 defaultTransferShareBps;
+        address migrationEmergencyKey;
+        address strictKey;
+    }
+
+    event SnapshotApplied(address indexed oldGuard, address indexed newGuard, bytes32 migrationDataHash);
+
+    error NotAuthorized();
+    error AlreadyInitialized();
+    error ZeroAddress();
+    error SnapshotMismatch();
+
+    modifier onlyAuthorizedMigration(address oldGuard) {
+        if (!IMigrationHubView(migrationHub).authorizedMigration(domainGuard)) revert NotAuthorized();
+        if (IMigrationHubView(migrationHub).acceptedFrom(domainGuard, oldGuard) != true) revert NotAuthorized();
+        _;
+    }
+
+    constructor(
+        address domainGuard_,
+        address migrationHub_,
+        address ownerRegistry_,
+        address policyRegistry_,
+        address subscriptions_
+    ) {
+        if (domainGuard_ == address(0) || domainGuard_.code.length == 0) revert ZeroAddress();
+        if (migrationHub_ == address(0) || migrationHub_.code.length == 0) revert ZeroAddress();
+        domainGuard = domainGuard_;
+        migrationHub = migrationHub_;
+        ownerRegistry = ownerRegistry_;
+        policyRegistry = policyRegistry_;
+        subscriptions = subscriptions_;
+    }
+
+    /// @notice Применяет снапшот на новом Guard-е. Вызывается MigrationHub-ом
+    ///         сразу после финализации.
+    function applySnapshot(address oldGuard, bytes32 migrationDataHash, bytes calldata migrationData)
+        external
+        onlyAuthorizedMigration(oldGuard)
+    {
+        if (initialized) revert AlreadyInitialized();
+        if (keccak256(migrationData) != migrationDataHash) revert SnapshotMismatch();
+
+        MigrationData memory d = abi.decode(migrationData, (MigrationData));
+        _apply(oldGuard, d);
+        initialized = true;
+        emit SnapshotApplied(oldGuard, domainGuard, migrationDataHash);
+    }
+
+    /// @notice Включает Permit2-разрешение для кошелька на новом Guard-е.
+    function enablePermit2OnWallet(address wallet, address token) external onlyAuthorizedMigration(IGuardView(domainGuard).expectedOldGuard()) {
+        if (!IPolicyRegistryView(policyRegistry).approvedToken(token)) revert NotAuthorized();
+        if (ISmartWalletView(wallet).guard() != domainGuard) revert NotAuthorized();
+        ISmartWalletView(wallet).emergencyEnablePermit2ForGuard(token);
+    }
+
+    /// @notice Предлагает кошельку сменить Guard на новый (ТЗ v6.1 §32).
+    function proposeWalletGuardMigration(address newGuard, address wallet)
+        external
+        onlyAuthorizedMigration(IGuardView(domainGuard).expectedOldGuard())
+    {
+        if (wallet.code.length == 0) revert ZeroAddress();
+        if (ISmartWalletView(wallet).guard() != domainGuard) revert NotAuthorized();
+        if (IOwnerRegistryView(ownerRegistry).isRegisteredWallet(wallet) == false) revert NotAuthorized();
+        ISmartWalletView(wallet).proposeGuardMigration(newGuard);
+    }
+
+    function _apply(address oldGuard, MigrationData memory d) internal {
+        address oldOwners = IGuardView(oldGuard).ownerRegistry();
+        address oldPolicy = IGuardView(oldGuard).policyRegistry();
+
+        // ---- owners ----
+        address[] memory owners = IOwnerRegistryView(oldOwners).getOwners();
+        if (owners.length != d.owners.length || d.isHot.length != owners.length) revert SnapshotMismatch();
+        uint256 hot;
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (owners[i] != d.owners[i]) revert SnapshotMismatch();
+            if (IOwnerRegistryView(oldOwners).isOwnerHot(owners[i]) != d.isHot[i]) revert SnapshotMismatch();
+            if (d.isHot[i]) hot++;
+        }
+        if (hot != 3 || owners.length != 5) revert SnapshotMismatch();
+        IOwnerRegistryView(ownerRegistry).changeOwners(d.owners, d.isHot);
+
+        // ---- wallets ----
+        _wallets(oldOwners, d.hotWallets, true);
+        _wallets(oldOwners, d.coldWallets, false);
+
+        // ---- registries (аддитивно, как и раньше) ----
+        _simple(oldPolicy, d.approvedTokens, 1);
+        _simple(oldPolicy, d.approvedRouters, 2);
+        _simple(oldPolicy, d.blacklistAddrs, 3);
+        _simple(oldPolicy, d.tradingPlatforms, 4);
+
+        // ---- contract policies ----
+        if (d.policyContracts.length != d.policyUsdLimits.length
+            || d.policyContracts.length != d.policyShareBps.length
+            || d.policyContracts.length != d.policyDeadlines.length
+            || d.policyContracts.length != d.policyBlocked.length) revert SnapshotMismatch();
+        for (uint256 i = 0; i < d.policyContracts.length; i++) {
+            address target = d.policyContracts[i];
+            (bool exists, bool blocked, uint256 usdLimit, , uint256 shareBps, uint256 dl) =
+                IPolicyRegistryView(oldPolicy).getContractPolicy(target);
+            if (!exists) revert SnapshotMismatch();
+            if (blocked != d.policyBlocked[i] || usdLimit != d.policyUsdLimits[i]
+                || shareBps != d.policyShareBps[i] || dl != d.policyDeadlines[i]) revert SnapshotMismatch();
+            IPolicyRegistryView(policyRegistry).setContractPolicy(
+                target, d.policyBlocked[i], d.policyUsdLimits[i], d.policyShareBps[i], d.policyDeadlines[i]
+            );
+        }
+
+        // ---- token risk ----
+        for (uint256 i = 0; i < d.riskTokens.length; i++) {
+            (bool configured, uint8 category) = IPolicyRegistryView(oldPolicy).getTokenRisk(d.riskTokens[i]);
+            if (!configured || category != d.riskCategories[i]) revert SnapshotMismatch();
+            IPolicyRegistryView(policyRegistry).setTokenRisk(d.riskTokens[i], d.riskCategories[i]);
+        }
+
+        // ---- token price ----
+        for (uint256 i = 0; i < d.priceTokens.length; i++) {
+            (bool configured, uint256 priceE18, uint8 decimals) =
+                IPolicyRegistryView(oldPolicy).getTokenPrice(d.priceTokens[i]);
+            if (!configured || priceE18 != d.priceE18[i] || decimals != d.priceDecimals[i]) revert SnapshotMismatch();
+            IPolicyRegistryView(policyRegistry).setTokenPrice(d.priceTokens[i], d.priceE18[i], d.priceDecimals[i]);
+        }
+
+        // ---- token amount policies ----
+        for (uint256 i = 0; i < d.amountTokens.length; i++) {
+            (bool exists, uint256 maxAmount, uint256 shareBps) =
+                IPolicyRegistryView(oldPolicy).getTokenAmountPolicy(d.amountTargets[i], d.amountTokens[i]);
+            if (!exists || maxAmount != d.amountMax[i] || shareBps != d.amountShareBps[i]) revert SnapshotMismatch();
+            IPolicyRegistryView(policyRegistry).setTokenAmountPolicy(
+                d.amountTargets[i], d.amountTokens[i], d.amountMax[i], d.amountShareBps[i]
+            );
+        }
+
+        // ---- recovery targets ----
+        for (uint256 i = 0; i < d.recoveryTokens.length; i++) {
+            (bool exists, address recipient) =
+                IPolicyRegistryView(oldPolicy).getRecoveryTarget(d.recoveryWallets[i], d.recoveryTokens[i]);
+            if (!exists || recipient != d.recoveryRecipients[i]) revert SnapshotMismatch();
+            IPolicyRegistryView(policyRegistry).setRecoveryTarget(
+                d.recoveryWallets[i], d.recoveryTokens[i], d.recoveryRecipients[i]
+            );
+        }
+
+        if (d.defaultTransferShareBps != 0) {
+            IPolicyRegistryView(policyRegistry).setDefaultTransferShareBps(d.defaultTransferShareBps);
+        }
+
+        // ---- subscription + configuration ----
+        ISubscriptionsView(subscriptions).claimSubscription(d.subscriptionPlan, d.subscriptionExpiresAt);
+        ISubscriptionsView(subscriptions).claimConfiguration(
+            d.treasury, d.appVersionHash, d.p2pAdmin, d.p2pDAO, d.p2pTimeout,
+            new uint8[](0), new address[](0), new uint256[](0), new uint64[](0), new bool[](0)
+        );
+
+        // ---- Guard-локальное состояние через сам Guard ----
+        IGuardView(domainGuard).claimStrictKey(d.strictKey);
+        if (d.migrationEmergencyKey != address(0)) {
+            IGuardView(domainGuard).claimMigrationEmergencyKey(d.migrationEmergencyKey);
+        }
+        IGuardView(domainGuard).markInitialized();
+    }
+
+    function _wallets(address oldOwners, address[] memory wallets, bool isHot) internal {
+        for (uint256 i = 0; i < wallets.length; i++) {
+            address w = wallets[i];
+            if (!IOwnerRegistryView(oldOwners).isRegisteredWallet(w)) revert SnapshotMismatch();
+            if (IOwnerRegistryView(oldOwners).isHotWallet(w) != isHot) revert SnapshotMismatch();
+            for (uint256 j = 0; j < i; j++) {
+                if (wallets[j] == w) revert SnapshotMismatch();
+            }
+            IOwnerRegistryView(ownerRegistry).addWallet(w, isHot);
+        }
+    }
+
+    function _simple(address oldPolicy, address[] memory items, uint8 kind) internal {
+        for (uint256 i = 0; i < items.length; i++) {
+            address a = items[i];
+            if (a == address(0)) revert ZeroAddress();
+            bool inOld = kind == 1 ? IPolicyRegistryView(oldPolicy).approvedToken(a)
+                : kind == 2 ? IPolicyRegistryView(oldPolicy).approvedRouter(a)
+                : kind == 3 ? IPolicyRegistryView(oldPolicy).blacklist(a)
+                : IPolicyRegistryView(oldPolicy).tradingPlatform(a);
+            if (!inOld) revert SnapshotMismatch();
+            for (uint256 j = 0; j < i; j++) {
+                if (items[j] == a) revert SnapshotMismatch();
+            }
+            if (kind == 1) IPolicyRegistryView(policyRegistry).addToken(a);
+            else if (kind == 2) IPolicyRegistryView(policyRegistry).addRouter(a);
+            else if (kind == 3) IPolicyRegistryView(policyRegistry).addBlacklist(a);
+            else IPolicyRegistryView(policyRegistry).addTradingPlatform(a);
+        }
+    }
+}
