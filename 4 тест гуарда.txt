@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "../SmartWalletService-v1.0.1.sol";
+
+interface Vm {
+    function warp(uint256) external;
+    function expectRevert(bytes calldata) external;
+}
+
+contract MockServiceCore {
+    address public immutable mainWallet;
+    address public immutable permit2;
+    bool public approved = true;
+    bool public blocked;
+    bool public registered = true;
+    uint256 public collected;
+    uint256 public expectedThreshold = 3;
+    bool public expectedRequireCold = true;
+    function setApproved(bool value) external { approved = value; }
+    function setBlocked(bool value) external { blocked = value; }
+    function setRegistered(bool value) external { registered = value; }
+    function setExpectedVerification(uint256 threshold, bool requireCold) external { expectedThreshold = threshold; expectedRequireCold = requireCold; }
+    constructor(address owner_, address permit2_) { mainWallet = owner_; permit2 = permit2_; }
+    function migratedOut() external pure returns (bool) { return false; }
+    function migrationEmergencyKey() external pure returns (address) { return address(0); }
+    function isRegisteredWallet(address) external view returns (bool) { return registered; }
+    function approvedToken(address) external view returns (bool) { return approved; }
+    function blacklist(address) external view returns (bool) { return blocked; }
+    function verifyOwnerSignatures(bytes32, bytes[] calldata, uint256 threshold, bool requireCold) external view returns (bool) { require(threshold == expectedThreshold && requireCold == expectedRequireCold, "unexpected verifier policy"); return true; }
+    function collectSubscriptionPayment(uint8, address, uint256, uint256, bytes[] calldata) external { collected++; }
+}
+
+contract MockPaymentToken {}
+contract MockServiceWallet {
+    address public guard;
+    address public permit2;
+    bool public paused;
+    constructor(address guard_, address permit2_) { guard = guard_; permit2 = permit2_; }
+    function setPaused(bool value) external { paused = value; }
+}
+
+contract SmartWalletServiceTest {
+    Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    address private constant OWNER = address(0xA11CE);
+    address private constant PERMIT2 = address(0xBEEF);
+    address private token;
+    MockServiceCore private core;
+    SmartWalletService private service;
+    MockServiceWallet private wallet;
+    bytes[] private noSigs;
+
+    function setUp() public {
+        token = address(new MockPaymentToken());
+        core = new MockServiceCore(OWNER, PERMIT2);
+        service = new SmartWalletService(address(core), address(0));
+        wallet = new MockServiceWallet(address(core), PERMIT2);
+        service.setTreasury(address(0xD00D), 1, type(uint256).max, noSigs);
+        service.setPlanConfig(SmartWalletService.SubscriptionPlan.STANDARD, token, 10, 30 days, true, 2, type(uint256).max, noSigs);
+        service.setPlanConfig(SmartWalletService.SubscriptionPlan.PREMIUM, token, 20, 30 days, true, 3, type(uint256).max, noSigs);
+        core.setExpectedVerification(2, false);
+    }
+
+    function _subscribe(SmartWalletService.SubscriptionPlan plan, uint256 nonce) private {
+        service.subscribe(plan, address(wallet), nonce, type(uint256).max, noSigs);
+    }
+    function _standardMask() private view returns (uint256) {
+        return service.PERM_APP_VERIFY() | service.PERM_EMERGENCY() | service.PERM_COLD_WARM()
+            | service.PERM_P2P() | service.PERM_SECURITY() | service.PERM_TRADING();
+    }
+
+    function testFreePlanAndMask() public view {
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.FREE);
+        require(service.permissionMask(OWNER) == (service.PERM_APP_VERIFY() | service.PERM_EMERGENCY()));
+    }
+    function testFreeCanVerifyAuthenticAppHash() public {
+        service.setAppVersionHash(bytes32(uint256(7)), 4, type(uint256).max, noSigs);
+        require(service.isAppVersionAuthentic(OWNER, bytes32(uint256(7))));
+        require(!service.isAppVersionAuthentic(OWNER, bytes32(uint256(8))));
+    }
+    function testUnknownAccountHasNoPermissions() public view {
+        require(service.activePlan(address(0x1234)) == SmartWalletService.SubscriptionPlan.FREE);
+        require(service.permissionMask(address(0x1234)) == 0);
+        require(!service.hasPermission(address(0x1234), service.PERM_EMERGENCY()));
+    }
+    function testStandardGrantsAllOnchainPermissions() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 10);
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.STANDARD);
+        require(service.permissionMask(OWNER) == _standardMask());
+        require(service.canUseP2P(OWNER));
+        require(service.hasPermission(OWNER, service.PERM_TRADING()));
+        require(core.collected() == 1);
+    }
+    function testPremiumUsesSameOnchainPermissions() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.PREMIUM, 11);
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.PREMIUM);
+        require(service.permissionMask(OWNER) == _standardMask());
+    }
+    function testExpiredSubscriptionReturnsToFree() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 12);
+        vm.warp(block.timestamp + 30 days);
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.FREE);
+        require(service.permissionMask(OWNER) == (service.PERM_APP_VERIFY() | service.PERM_EMERGENCY()));
+    }
+    function testExpiredSubscriptionLosesStandardPermissions() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 13);
+        vm.warp(block.timestamp + 30 days);
+        require(!service.hasPermission(OWNER, service.PERM_TRADING()));
+        require(!service.canUseP2P(OWNER));
+    }
+    function testStandardRenewalExtendsFromExistingExpiry() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 14);
+        (, uint64 firstExpiry) = service.getSubscription(OWNER);
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 15);
+        (, uint64 secondExpiry) = service.getSubscription(OWNER);
+        require(secondExpiry == firstExpiry + 30 days);
+    }
+    function testPremiumRenewalExtendsFromExistingExpiry() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.PREMIUM, 16);
+        (, uint64 firstExpiry) = service.getSubscription(OWNER);
+        _subscribe(SmartWalletService.SubscriptionPlan.PREMIUM, 17);
+        (, uint64 secondExpiry) = service.getSubscription(OWNER);
+        require(secondExpiry == firstExpiry + 30 days);
+    }
+    function testDisabledPlanCannotBePurchased() public {
+        core.setExpectedVerification(3, true);
+        service.setPlanConfig(SmartWalletService.SubscriptionPlan.STANDARD, token, 10, 30 days, false, 18, type(uint256).max, noSigs);
+        vm.expectRevert(bytes("plan disabled"));
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 19);
+    }
+    function testUnapprovedPaymentTokenCannotConfigureEnabledPlan() public {
+        core.setApproved(false);
+        vm.expectRevert(bytes("payment token unavailable"));
+        service.setPlanConfig(SmartWalletService.SubscriptionPlan.STANDARD, token, 10, 30 days, true, 20, type(uint256).max, noSigs);
+    }
+    function testZeroPriceCannotConfigureEnabledPlan() public {
+        vm.expectRevert(bytes("bad plan config"));
+        service.setPlanConfig(SmartWalletService.SubscriptionPlan.STANDARD, token, 0, 30 days, true, 21, type(uint256).max, noSigs);
+    }
+    function testPlanConfigRequiresCriticalVerifier() public {
+        // Mock verifier can observe that the configuration path requests 3 signatures + Cold.
+        core.setExpectedVerification(3, true);
+        service.setPlanConfig(SmartWalletService.SubscriptionPlan.STANDARD, token, 11, 30 days, true, 22, type(uint256).max, noSigs);
+        (, uint256 configuredPrice,,) = service.getPlanConfig(SmartWalletService.SubscriptionPlan.STANDARD);
+        require(configuredPrice == 11);
+        require(core.expectedThreshold() == 3 && core.expectedRequireCold());
+    }
+    function testPausedWalletCannotSubscribe() public {
+        // Configure a paused wallet and verify the Service rejects it before collection.
+        MockServiceWallet pausedWallet = new MockServiceWallet(address(core), PERMIT2);
+        pausedWallet.setPaused(true);
+        vm.expectRevert(bytes("wallet paused"));
+        service.subscribe(SmartWalletService.SubscriptionPlan.STANDARD, address(pausedWallet), 99, type(uint256).max, noSigs);
+        require(address(pausedWallet) != address(0));
+    }
+    function testWrongPermit2WalletCannotSubscribe() public {
+        MockServiceWallet wrong = new MockServiceWallet(address(core), address(0x9999));
+        vm.expectRevert(bytes("wrong wallet permit2"));
+        service.subscribe(SmartWalletService.SubscriptionPlan.STANDARD, address(wrong), 23, type(uint256).max, noSigs);
+    }
+    function testUnregisteredWalletCannotSubscribe() public {
+        core.setRegistered(false);
+        vm.expectRevert(bytes("wallet not registered"));
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 24);
+    }
+    function testBlacklistedPaymentTokenCannotSubscribe() public {
+        core.setBlocked(true);
+        vm.expectRevert(bytes("payment token blacklisted"));
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 25);
+    }
+    function testDuplicateSubscriptionNonceRejected() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 26);
+        vm.expectRevert(bytes("nonce used"));
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 26);
+    }
+    function testFreeHasEmergencyPermission() public view {
+        require(service.hasPermission(OWNER, service.PERM_EMERGENCY()));
+    }
+    function testFreeLacksTradingAndP2PPermissions() public view {
+        require(!service.hasPermission(OWNER, service.PERM_TRADING()));
+        require(!service.hasPermission(OWNER, service.PERM_P2P()));
+    }
+    function testStandardHasColdWarmSecurityAndTrading() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 27);
+        require(service.hasPermission(OWNER, service.PERM_COLD_WARM()));
+        require(service.hasPermission(OWNER, service.PERM_SECURITY()));
+        require(service.hasPermission(OWNER, service.PERM_TRADING()));
+    }
+    function testPremiumHasNoExtraOnchainPermissionBits() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 28);
+        uint256 standard = service.permissionMask(OWNER);
+        _subscribe(SmartWalletService.SubscriptionPlan.PREMIUM, 29);
+        require(service.permissionMask(OWNER) == standard);
+    }
+    function testExpiryBoundaryIsExclusive() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 30);
+        (, uint64 expiry) = service.getSubscription(OWNER);
+        vm.warp(expiry - 1);
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.STANDARD);
+        vm.warp(expiry);
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.FREE);
+    }
+    function testExpiredRenewalStartsFromNow() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 31);
+        (, uint64 expiry) = service.getSubscription(OWNER);
+        vm.warp(expiry + 100);
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 32);
+        (, uint64 renewedExpiry) = service.getSubscription(OWNER);
+        require(renewedExpiry == block.timestamp + 30 days);
+    }
+    function testCanUseTradingPlatformNeedsApprovalAndPermission() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 33);
+        require(!service.canUseTradingPlatform(OWNER, address(0x1234)));
+    }
+    function testFreeCannotUseServiceApprovedTradingPlatform() public {
+        MockPaymentToken platform = new MockPaymentToken();
+        core.setExpectedVerification(3, true);
+        service.addTradingPlatform(address(platform), 34, type(uint256).max, noSigs);
+        require(!service.canUseTradingPlatform(OWNER, address(platform)));
+    }
+    function testStandardCanUseServiceApprovedTradingPlatform() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 35);
+        MockPaymentToken platform = new MockPaymentToken();
+        core.setExpectedVerification(3, true);
+        service.addTradingPlatform(address(platform), 36, type(uint256).max, noSigs);
+        require(service.canUseTradingPlatform(OWNER, address(platform)));
+    }
+    function testTreasuryChangeUsesCriticalVerifier() public {
+        core.setExpectedVerification(3, true);
+        service.setTreasury(address(0xD00E), 37, type(uint256).max, noSigs);
+        require(core.expectedThreshold() == 3 && core.expectedRequireCold());
+    }
+    function testAppVersionUpdateUsesHotVerifier() public {
+        service.setAppVersionHash(bytes32(uint256(88)), 38, type(uint256).max, noSigs);
+        require(core.expectedThreshold() == 2 && !core.expectedRequireCold());
+    }
+    function testPlanSwitchChangesPlanAndStartsNewPeriod() public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 39);
+        vm.warp(block.timestamp + 7 days);
+        uint256 switchedAt = block.timestamp;
+        _subscribe(SmartWalletService.SubscriptionPlan.PREMIUM, 40);
+        (, uint64 expiry) = service.getSubscription(OWNER);
+        require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.PREMIUM);
+        require(expiry == switchedAt + 30 days);
+    }
+    function testFuzz_nonOwnerAccountNeverGetsPaidPermission(address account, uint8 bit) public view {
+        if (account == OWNER) return;
+        uint256 permission = uint256(1) << (uint256(bit) % 6);
+        require(!service.hasPermission(account, permission));
+    }
+    function testFuzz_expiryRemovesStandardPermissions(uint8 elapsedDays) public {
+        _subscribe(SmartWalletService.SubscriptionPlan.STANDARD, 41);
+        vm.warp(block.timestamp + uint256(elapsedDays) * 1 days);
+        if (elapsedDays >= 30) {
+            require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.FREE);
+            require(!service.hasPermission(OWNER, service.PERM_TRADING()));
+        } else {
+            require(service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.STANDARD);
+        }
+    }
+    function invariant_permissionMaskMatchesActivePlan() public view {
+        uint256 mask = service.permissionMask(OWNER);
+        if (service.activePlan(OWNER) == SmartWalletService.SubscriptionPlan.FREE) {
+            require(mask == (service.PERM_APP_VERIFY() | service.PERM_EMERGENCY()));
+        } else {
+            require(mask == _standardMask());
+        }
+    }
+}

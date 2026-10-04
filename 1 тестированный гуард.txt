@@ -1,0 +1,47 @@
+# SmartWalletGuard: сверка и выполненные изменения
+
+Исходники из Desktop оставлены без изменений. Обновлённые копии находятся здесь:
+
+- `SmartWalletGuardCore-v5.2.1.sol`
+- `SmartWalletService-v1.0.1.sol`
+- Foundry suite: `test/SmartWalletService.t.sol`
+
+## Что было → что стало
+
+| Файл / функция | Было | Стало |
+|---|---|---|
+| Core `transfer`, `transferNative` | Core не проверял подписку | Перед выполнением требует Service-разрешения `COLD_WARM + SECURITY`; FREE отклоняется |
+| Core `executeSwap` | Core не проверял подписку и не сверял фактический router с Service platform registry | Требует `TRADING + SECURITY`, проверяет router в Core registry и `canUseTradingPlatform(mainWallet, router)` в Service |
+| Core `emergencySweep` | Оставался отдельным аварийным путём | Не проверяет тариф, требует paused SmartWallet, recovery target и 2 Hot-подписи; ERC20-путь проверяет `uint160` и Permit2 allowance |
+| Core `setService`, `collectSubscriptionPayment` | Service не был источником проверяемых entitlements; Service сам принимал оплату | Core с критическими подписями привязывает Service; Service вызывает Core, который переводит точную цену непосредственно из registered wallet в treasury через Permit2 |
+| Core `addHotWallet`, `addColdWallet` | Регистрация должна была быть проверена на отсутствие скрытого движения средств | Функции только меняют registry и эмитят событие; вызовов `transfer` в этих функциях нет |
+| Core token/router/blacklist/adapter registry и recovery target | Изменения принимались 2 Hot | Изменения требуют 3 владельцев и минимум одного Cold |
+| Service trading-platform registry | Изменения принимались 2 Hot | Добавление/удаление платформ требует 3 владельцев и минимум одного Cold |
+| Service `activePlan`, `hasPermission`, `subscribe` | Нужно было проверить FREE/expiry/renewal/payment flow | FREE действует при отсутствии подписки и с момента `timestamp >= expiresAt`; одинаковый активный тариф продлевается от старого expiry; переход на другой тариф начинается от текущего времени. Permissions Premium равны Standard на chain |
+
+Service проверяет main wallet, регистрацию кошелька, Guard, Permit2, pause state, whitelist токена Core и blacklist перед оплатой. Core повторяет проверки непосредственно перед переводом и отклоняет нулевую/слишком большую цену, выключенный тариф, истёкшую/недостаточную Permit2 allowance и недействительный treasury.
+
+## Компиляция
+
+Solidity 0.8.30, optimizer 200, `viaIR`, единая компиляция Core + Service + тестового файла: **0 ошибок**. Размеры runtime bytecode:
+
+- Core: **45 498 байт** (лимит EVM: 24 576)
+- Service: **21 092 байта** (в пределах лимита)
+
+Core всё ещё нельзя развернуть в стандартной EVM-сети. Конкретный следующий вынос: отдельный `GuardPolicyRegistry` для whitelist/adapter/token/router/blacklist и конфигурации, плюс отдельный `GuardMigrationCoordinator` для snapshot/migration flow. Сейчас эту архитектурную переделку не выполнял: Core превышает лимит более чем на 20 КБ, и один небольшой вынос проблему не решит.
+
+## Foundry
+
+Добавлен проект `foundry.toml` и 30 обычных Service unit-сценариев, 2 fuzz-сценария и 1 invariant-сценарий. Тестовый Solidity-файл успешно компилируется тем же Solidity 0.8.30.
+
+**Foundry тесты фактически не стартовали и не прошли.** `forge test --root outputs --config-path outputs/foundry.toml -vv` завершается panic до обнаружения тестов: `could not detect user home directory` (`C:\Users\Administrator`, Foundry svm-rs Windows runtime). Поэтому я не утверждаю, что unit/fuzz/invariant тесты прошли.
+
+Кроме того, созданная suite покрывает Service с mock Core/кошельком; она пока не является интеграционной проверкой Guard + реального SmartWallet + Permit2 и не подтверждает migration или ERC20/native emergency sweep.
+
+## Остаточные риски и незакрытые проверки
+
+1. **P2P:** в двух исходниках нет on-chain P2P transfer/action endpoint. Service предоставляет `canUseP2P`; каждый внешний P2P backend/контракт обязан проверять его самостоятельно.
+2. **Migration completeness:** `acceptMigration` проверяет каждый переданный элемент snapshot относительно старого Guard, но старый контракт не предоставляет enumerable-списки для всех mapping-ов. Получатель не может доказать, что переданы все whitelist/recovery/policy записи; необходим проверяемый полный snapshot/indexer-процесс и integration tests.
+3. **Wallet migration / Permit2 revoke:** фактические смена Guard и отзыв старой allowance реализованы внешним SmartWallet, исходник которого не приложен. Здесь подтверждены только интерфейсные вызовы, не поведение реального wallet.
+4. **Критические пути:** нужен запуск 30 unit + fuzz + invariant и отдельные Core/Permit2 интеграционные тесты на окружении, где Forge стартует. Особенно: аварийный native/ERC20 sweep с 2 Hot, запрет FREE на transfer/swap, точная подписка/treasury, migration cancel limit и полный wallet migration.
+5. Пока Core превышает EVM size limit, этот результат **не готов к production deployment**.
